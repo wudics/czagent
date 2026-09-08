@@ -1,0 +1,10 @@
+在文件中执行精确的字符串替换。
+
+用法：
+- 在编辑前，你必须在对话中至少使用一次 `Read` 工具。如果你在未读取文件的情况下尝试编辑，此工具会报错。
+- 从 Read 工具输出中编辑文本时，确保保留行号前缀后面出现的精确缩进（制表符/空格）。行号前缀格式为：行号 + 冒号 + 空格（例如 `1: `）。该空格之后的任何内容都是要匹配的实际文件内容。在 oldString 或 newString 中绝不要包含行号前缀的任何部分。
+- 始终优先编辑代码库中的现有文件。除非明确需要，绝不要编写新文件。
+- 只有用户明确要求时才使用 emoji。除非被要求，否则避免在文件中添加 emoji。
+- 如果在文件中找不到 oldString，编辑将失败并报错 "oldString not found in content"。
+- 如果 oldString 在文件中出现多次，编辑将失败并报错 "Found multiple matches for oldString. Provide more surrounding lines in oldString to identify the correct match."。要么提供更大的字符串和更多周围上下文使其唯一，要么使用 `replaceAll` 更改文件中该字符串的每个实例。
+- 使用 `replaceAll` 跨文件替换和重命名字符串。当你想要重命名一个变量时，此参数很有用。

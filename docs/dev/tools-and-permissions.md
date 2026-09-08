@@ -1,0 +1,115 @@
+# 工具与权限
+
+> 对应 PLAN.md 决策 #6、#13、#16、#17、#18。设计参考 `docs/ref/opencode-1.18.19-src/packages/opencode/src/tool/` 与 `permission/`。
+
+## 1. 工具注册表
+
+```ts
+interface ToolDef {
+  id: string;                       // 全局唯一
+  description: string;              // 注入给模型的描述
+  inputSchema: JSONSchema;          // 参数 schema（校验入参）
+  execute(input: unknown, ctx: ToolCtx): Promise<ToolOutput>;
+  permission?: { action: PermissionAction; patterns?: string[] }; // 默认授权动作
+}
+
+interface ToolCtx {
+  sessionId: string;
+  cwd: string;                      // 会话工作目录（边界）
+  ask(req: PermissionRequest): Promise<PermissionDecision>;
+  messages: Message[];              // 只读上下文（模型可见的历史）
+  signal: AbortSignal;
+  metadata: (patch) => void;        // 流式更新 tool part（标题/状态）
+  modelRegistry: ModelRegistry;     // 供能力工具选择模型实例（决策 6）
+}
+```
+
+- 注册表 `resolve(agent.permissions)` 做工具过滤（disable 列表、agent 权限合并）。
+- 执行管线：`plugin.before → 权限断言 → inputSchema 校验 → execute → outputSchema 校验 → ToolOutput 规范化（输出上限/图片附件压缩）→ tool-result 事件`。
+
+## 2. 内置工具清单
+
+### 2.1 P1（MVP）
+
+| 工具 | 说明 | 权限动作 |
+|---|---|---|
+| `read` | 读文件（支持 offset/limit），cwd 外也允许读 | `read`（cwd 内自动放行） |
+| `write` | 写文件（cwd 内；cwd 外询问） | `write` + 路径检查 |
+| `edit` | 精确字符串替换编辑（先 read 后 edit 模式） | `edit` + 路径检查 |
+| `patch` | apply_patch 格式批量补丁（参考 opencode `apply_patch.ts`） | `edit` + 路径检查 |
+| `grep` | 内容搜索（支持正则、include 过滤） | `grep` |
+| `glob` | 文件名匹配 | `glob` |
+| `bash` | 终端命令（node-pty，见 §4） | `bash` + 路径检查 |
+| `webfetch` | 抓取网页 → markdown | `webfetch` |
+| `todowrite` | 维护任务清单（写入会话 todo 列表） | `todowrite` |
+| `plan` / `plan-exit` | 进入/退出 plan 模式（决策 18） | —（模式切换） |
+
+### 2.2 P2 扩展
+
+| 工具 | 说明 |
+|---|---|
+| `websearch` | 自研国内搜索（见 §5） |
+| `skill` | 动态加载 skill（见 skills-and-mcp.md） |
+| `task` | 子代理委派（决策 6 的 P2 部分） |
+| `embedding` / `rerank` | 向量能力工具（绑定 embedding/rerank 模型实例） |
+| `image_generate` / `video_generate` | 生成类工具（绑定生成模型实例，可指定模型 id） |
+| `tts` / `asr` / `image_understand` | 语音/视觉能力工具 |
+
+## 3. 权限模型（决策 13）
+
+### 3.1 边界
+- **会话 cwd** 内及其子目录：读写全权（无需询问）。
+- **cwd 外**：读取允许（只读）；写入/编辑/删除/重命名 → 弹权限确认，默认拒绝。
+- **bash**：cwd 内命令直接执行；cwd 外的破坏性命令（`rm -rf`、`rm` 到外部路径、写系统目录等）需确认；危险模式内置黑名单启发式 + 正则白名单（参考 opencode `permission/` 的 bash 判定）。
+
+### 3.2 规则（agent 配置的 `permission` 字段）
+```
+permission: {
+  allow: [ "read", "grep", "glob" ],
+  deny:  [ "bash" ],
+  ask:   [ "write", "edit" ],      // 默认未列出的敏感工具进入 ask
+  rules: [                          // 路径级规则（P2 增强）
+    { action: "write", pattern: "/path/to/project/**", mode: "allow" }
+  ]
+}
+```
+合并顺序：agent.permission（build/plan 默认）→ 会话级权限 → 用户 `user.tools` 禁用表。
+
+### 3.3 询问流程
+- 工具执行前 `ctx.ask(...)` → 主进程发 `permission.request` 事件 → UI 弹窗展示工具名/参数/目标路径，三选一：**允许本次 / 允许本次及以后（写入规则）/ 拒绝**。
+- 拒绝 → 工具返回 error 结果；若为关键拒绝 → 中断 loop（agent-loop.md §2）。
+- **doom-loop**：同一工具同一参数连续 3 次 → 询问（防死循环烧 token）。
+
+## 4. bash 工具（决策 16）
+
+- **node-pty**（`@lydell/node-pty`，Electron 适配版）：
+  - Windows → `powershell.exe`
+  - Linux/macOS → `bash` / `zsh`
+- 每个会话一个持久 shell 会话（PtyPool 管理），支持：
+  - 交互式命令（`npm init` 提示、编辑器）
+  - Ctrl+C 中断（转发到 pty）
+  - ANSI 颜色保留（渲染层剥离/着色处理）
+- 输出上限：单次命令输出截断（如 30k 字符），超限截断提示。
+- 超时：命令级超时（可配），超时 kill + 报错。
+- **平台差异**：Windows 用 `powershell -NoProfile -Command` 语义，脚本/路径分隔符差异在工具描述中说明；cwd 检查用 `realpath` 归一化路径（大小写、符号链接）防止绕过。
+
+## 5. websearch（决策 17，P2）
+
+自研抓取国内搜索引擎，不依赖第三方搜索 API：
+
+- **引擎**：360 搜索、搜狗、国内 Bing、百度，按可用性降级（`try each → 首个返回结果`）。
+- **流程**：
+  1. 构造各引擎搜索 URL（带 query + 翻页参数）。
+  2. 抓取 HTML → 按引擎解析器提取 `[{ title, url, snippet }]`（编码容错：UTF-8/GBK 自动检测）。
+  3. 相关性打分（标题/摘要与 query 关键词匹配）排序。
+  4. **内容不足时翻页**：翻页最多 3 次，聚合去重。
+  5. 对高匹配结果，agent 可用 `webfetch` 抓详情页（工具描述中引导）。
+- **风险应对**：反爬（UA、延时、频率限制 ≤1 次/2s）、解析器隔离（每引擎一个模块，结构变化只影响单引擎）、失败静默降级。
+- 配置：引擎开关、请求间隔、结果条数。
+
+## 6. 工具结果回填
+
+- 工具输出按 `ToolOutput { output, title, metadata, attachments }` 结构化。
+- 文本输出直接作为 tool-result part；图片附件经压缩后按 data URL / 文件引用回填。
+- 下一轮请求时，assistant 消息的 tool-call + tool-result parts 转回 `tool_calls` 与 `role:tool` 消息（DeepSeek 需同时回传 `reasoning_content`，见 llm-engine.md §4.2）。
+- 工具报错 → `result.type:'error'`，模型下一轮可见错误描述（允许自纠）。

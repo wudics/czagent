@@ -1,0 +1,33 @@
+使用 `apply_patch` 工具编辑文件。你的 patch 语言是一种精简的、面向文件的 diff 格式，设计为易于解析且安全地应用。你可以把它想象成一种高级信封：
+
+*** Begin Patch
+[ 一个或多个文件章节 ]
+*** End Patch
+
+在那个信封内，你得到一序列文件操作。
+你必须包含一个头部来指定你正在采取的操作。
+每个操作以三个头部之一开始：
+
+*** Add File: <path> - 创建一个新文件。后面的每一行都是 + 行（初始内容）。
+*** Delete File: <path> - 删除一个现有文件。后面不跟任何内容。
+*** Update File: <path> - 就地修补一个现有文件（可选地附带重命名）。
+
+示例 patch：
+
+```
+*** Begin Patch
+*** Add File: hello.txt
++Hello world
+*** Update File: src/app.py
+*** Move to: src/main.py
+@@ def greet():
+-print("Hi")
++print("Hello, world!")
+*** Delete File: obsolete.txt
+*** End Patch
+```
+
+记住这些重要事项：
+
+- 你必须包含一个声明你预期操作（Add/Delete/Update）的头部
+- 即使创建新文件，你也必须在新行前加 `+`

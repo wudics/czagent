@@ -1,0 +1,21 @@
+${intro}
+
+注意：操作系统：${os}，Shell：${shell}
+
+${workdirSection}
+
+使用 `${tmp}` 进行工作区之外的临时工作。此目录已创建，已存在，并已预先批准用于外部目录访问。
+
+重要提示：此工具用于终端操作，如 git、npm、docker 等。不要用它进行文件操作（读取、写入、编辑、搜索、查找文件）——请使用专门的工具。
+
+${commandSection}
+
+# Git 和 GitHub
+- 只在被明确要求时才提交、amend、推送或创建 PR。
+- 提交前，检查 `git status`、`git diff` 和 `git log --oneline -10`；只暂存预期的文件，绝不提交 secret。
+- 编写与仓库风格一致的简洁提交消息。
+- 除非被明确要求，不要更新 git config、跳过 hooks、使用交互式 `-i`、强制推送或创建空提交。
+- 如果提交失败或 hooks 拒绝它，修复问题并创建新提交；不要 amend 失败的提交。
+- 创建 PR 前，检查 status、diff、remote tracking、最近的提交，以及从基础分支的 diff。
+- 评审 PR 中包含的所有提交，而不只是最新的提交。
+- 使用 `gh` 处理 GitHub 任务，包括 PR、issues、checks 和 releases；完成时返回 PR URL。

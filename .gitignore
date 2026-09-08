@@ -1,0 +1,9 @@
+# Dependencies
+node_modules/
+packages/core/node_modules/
+packages/desktop/node_modules/
+
+# Build output
+packages/desktop/out
+packages/desktop/release
+

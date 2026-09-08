@@ -1,0 +1,12 @@
+packages:
+  - 'packages/*'
+
+allowBuilds:
+  electron: true
+  esbuild: true
+  electron-winstaller: true
+  better-sqlite3: true
+  '@lydell/node-pty': true
+
+overrides:
+  '@noble/hashes': '1.8.0'

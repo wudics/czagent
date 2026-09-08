@@ -1,0 +1,24 @@
+与语言服务器协议（LSP）服务器交互，获取代码智能功能。
+
+支持的操作：
+- goToDefinition: 查找符号定义的位置
+- findReferences: 查找对符号的所有引用
+- hover: 获取符号的悬停信息（文档、类型信息）
+- documentSymbol: 获取文档中的所有符号（函数、类、变量）
+- workspaceSymbol: 列出匹配查询字符串的项目范围符号
+- goToImplementation: 查找接口或抽象方法的实现
+- prepareCallHierarchy: 获取某位置（函数/方法）的调用层级条目
+- incomingCalls: 查找调用某位置函数/方法的所有函数/方法
+- outgoingCalls: 查找某位置函数/方法调用的所有函数/方法
+
+所有操作都需要：
+- filePath: 要操作的文件
+- line: 行号（从 1 开始，如编辑器所示）
+- character: 字符偏移（从 1 开始，如编辑器所示）
+
+workspaceSymbol 还接受：
+- query: 用于过滤符号的查询字符串。空字符串表示请求所有符号。
+
+对于 workspaceSymbol，filePath 不会在 LSP workspace/symbol 请求中发送。它由 opencode 用来选择和启动匹配的 LSP 服务器。
+
+注意：必须为文件类型配置 LSP 服务器。如果没有可用的服务器，将返回错误。

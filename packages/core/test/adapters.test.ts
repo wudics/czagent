@@ -225,8 +225,8 @@ describe('富输出链路（对象返回）', () => {
   it('能力未适配：tts 绑定 agnes 模型 → 统一报错且 fetch 未被调用', async () => {
     stubFetch([]);
     const settings = agnesSettings();
-    settings.bindings = settings.bindings.map((b) => (b.capability === 'tts' ? { ...b, modelId: 'agnes-video-2.5' } : b));
-    await expect(ttsTool.execute({ text: '你好' }, toolCtx(settings))).rejects.toThrow(/语音合成（TTS）当前不支持.*agnes-video-2.5/);
+    settings.bindings = settings.bindings.map((b) => (b.capability === 'tts' ? { ...b, modelId: 'agnes-video-2.5-flash' } : b));
+    await expect(ttsTool.execute({ text: '你好' }, toolCtx(settings))).rejects.toThrow(/语音合成（TTS）当前不支持.*agnes-video-2\.5/);
     expect(calls.length).toBe(0);
   });
 });

@@ -90,6 +90,7 @@ function registerIpc(mgr: SessionManager): void {
   ipcMain.handle(IPC.messages.send, (_e, sessionId, input) => mgr.sendMessage(sessionId, input));
   ipcMain.handle(IPC.session.stop, (_e, sessionId) => mgr.stopSession(sessionId));
   ipcMain.handle(IPC.session.compact, (_e, sessionId) => mgr.compactSession(sessionId));
+  ipcMain.handle(IPC.session.context, (_e, sessionId) => mgr.getSessionContext(sessionId));
   ipcMain.handle(IPC.session.usage, (_e, sessionId) => mgr.getUsage(sessionId));
   ipcMain.handle(IPC.attachments.upload, (_e, sessionId, upload) => mgr.uploadAttachment(sessionId, upload));
   ipcMain.handle(IPC.settings.get, () => mgr.getSettings());

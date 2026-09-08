@@ -8,6 +8,7 @@ import type {
   PermissionDecision,
   PermissionRequest,
   SendMessageInput,
+  SessionContext,
   SessionEvent,
   SessionMeta,
   SessionPatch,
@@ -16,7 +17,7 @@ import type {
 } from '@czagent/core';
 import { buildScenario, chunkText, historyAssistantParts, HISTORY_USER_PROMPTS, MOCK_CWD, MOCK_MODELS, partFromPhase, type StreamPhase } from './scenarios';
 import { loadSettings, saveSettings } from './settingsStorage';
-import { mergeSettings } from '@czagent/core';
+import { mergeSettings, usageTotal } from '@czagent/core';
 
 let uid = 0;
 function nextId(prefix: string): string {
@@ -208,6 +209,8 @@ export class MockProvider implements AgentProvider {
   private aborts = new Map<string, AbortController>();
   /** 每个会话的实时 usage 累计（mock） */
   private usage = new Map<string, Usage>();
+  /** 每个会话的上下文占用（mock：随回复增长、压缩后回落） */
+  private contextUsed = new Map<string, number>();
 
   private static LONG_TOTAL = 1200;
 
@@ -263,6 +266,7 @@ export class MockProvider implements AgentProvider {
     this.sessions = this.sessions.filter((s) => s.id !== id);
     this.shortMessages.delete(id);
     this.extras.delete(id);
+    this.contextUsed.delete(id);
     this.aborts.get(id)?.abort();
     this.aborts.delete(id);
   }
@@ -365,6 +369,8 @@ export class MockProvider implements AgentProvider {
     if (extras && extras.length > 0) extras.splice(extras.length - 1, 0, checkpoint);
     else this.extras.set(sessionId, [checkpoint]);
     this.emitter.emit({ sessionId, type: 'session.compacted', message: checkpoint });
+    // 模拟压缩后回落：尾部保留（~15k 上限）+ 摘要
+    this.emitContext(sessionId, 12_000 + Math.round(Math.random() * 4_000));
     return true;
   }
 
@@ -375,6 +381,24 @@ export class MockProvider implements AgentProvider {
 
   async getUsage(sessionId: string): Promise<Usage | null> {
     return this.usage.get(sessionId) ?? null;
+  }
+
+  async getSessionContext(sessionId: string): Promise<SessionContext | null> {
+    const meta = this.sessions.find((s) => s.id === sessionId);
+    if (!meta) return null;
+    return { used: this.contextUsed.get(sessionId) ?? 0, limit: this.contextLimitOf(meta.modelId) };
+  }
+
+  /** 模型上下文窗口（0 = 未知），按当前设置解析 */
+  private contextLimitOf(modelId: string): number {
+    return loadSettings().models.find((m) => m.id === modelId)?.contextLimit ?? 0;
+  }
+
+  /** 记录并推送上下文占用（回复完成 / 手动压缩后调用） */
+  private emitContext(sessionId: string, used: number): void {
+    const meta = this.sessions.find((s) => s.id === sessionId);
+    this.contextUsed.set(sessionId, used);
+    this.emitter.emit({ sessionId, type: 'session.context', used, limit: this.contextLimitOf(meta?.modelId ?? '') });
   }
 
   async uploadAttachment(sessionId: string, upload: AttachmentUpload): Promise<Attachment> {
@@ -553,9 +577,9 @@ export class MockProvider implements AgentProvider {
       cost: (prev?.cost ?? 0) + usage.cost,
     });
 
-    // 与真实实现对齐：先推本次请求用量（占用条实时刷新），再推累计总量
-    this.emitter.emit({ sessionId, type: 'session.context', usage });
     this.emitter.emit({ sessionId, type: 'session.usage', usage: this.usage.get(sessionId)! });
+    // 上下文仪表：累计用量折算 + system prompt 近似值（与真实实现的权威口径对齐）
+    this.emitContext(sessionId, usageTotal(this.usage.get(sessionId)!) + 8_000);
     this.emitter.emit({ sessionId, type: 'message.complete', messageId, message });
     this.setStatus(sessionId, 'idle');
     this.maybeAutoTitle(sessionId, input);

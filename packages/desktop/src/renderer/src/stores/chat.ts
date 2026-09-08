@@ -3,6 +3,7 @@ import {
   getProvider,
   type ChatMessage,
   type MessagePart,
+  type SessionContext,
   type SessionEvent,
   type Usage,
 } from '@czagent/core';
@@ -41,8 +42,8 @@ interface ChatState {
   lastTopShift: number;
   replying: boolean;
   usage: Usage | null;
-  /** 逐轮 LLM 请求用量（session.context 事件）：占用条实时刷新用，仅对当前会话有效（open 时 reset） */
-  contextUsage: Usage | null;
+  /** 上下文占用（主进程权威口径：max(请求估算, 上次真实 usage) + 模型窗口；session.context 事件实时推送） */
+  context: SessionContext | null;
   /** 手动压缩进行中（摘要为一次 LLM 调用，需数秒） */
   compacting: boolean;
   open(sessionId: string): Promise<void>;
@@ -85,7 +86,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   lastTopShift: 0,
   replying: false,
   usage: null,
-  contextUsage: null,
+  context: null,
   compacting: false,
 
   reset() {
@@ -97,7 +98,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       lastTopShift: 0,
       replying: false,
       usage: null,
-      contextUsage: null,
+      context: null,
       compacting: false,
     });
   },
@@ -113,7 +114,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       replying: meta?.status === 'running' || meta?.status === 'queued',
     });
     const usage = await getProvider().getUsage(sessionId);
-    set({ usage });
+    let context: SessionContext | null = null;
+    try {
+      context = await getProvider().getSessionContext(sessionId);
+    } catch {
+      // 上下文拉取失败不影响会话打开（事件随后会补）
+    }
+    set({ usage, context });
   },
 
   attachEvents() {
@@ -227,8 +234,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         set({ usage: ev.usage });
         break;
       case 'session.context':
-        // 每次 LLM 请求的实时用量：占用条直播刷新（消息 finalize 后仍以 m.tokens 为准）
-        set({ contextUsage: ev.usage });
+        // 上下文仪表：主进程权威口径（下一次请求规模 + 模型窗口），随请求构建/回复落库/压缩实时刷新
+        set({ context: { used: ev.used, limit: ev.limit } });
         break;
       default:
         break;

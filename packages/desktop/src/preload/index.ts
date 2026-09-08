@@ -11,6 +11,7 @@ const api: IpcApi = {
   sendMessage: (sessionId, input) => ipcRenderer.invoke(IPC.messages.send, sessionId, input),
   stopSession: (sessionId) => ipcRenderer.invoke(IPC.session.stop, sessionId),
   compactSession: (sessionId) => ipcRenderer.invoke(IPC.session.compact, sessionId),
+  getSessionContext: (sessionId) => ipcRenderer.invoke(IPC.session.context, sessionId),
   getUsage: (sessionId) => ipcRenderer.invoke(IPC.session.usage, sessionId),
   uploadAttachment: (sessionId, upload) => ipcRenderer.invoke(IPC.attachments.upload, sessionId, upload),
   getSettings: () => ipcRenderer.invoke(IPC.settings.get),

@@ -50,6 +50,14 @@ export interface Usage {
   cost: number;
 }
 
+/** 当前会话的上下文占用（主进程权威口径：est = max(请求估算, 上次真实 usage)） */
+export interface SessionContext {
+  /** 下一次请求的上下文规模（token） */
+  used: number;
+  /** 模型 contextLimit（0 = 未知/不限制） */
+  limit: number;
+}
+
 export type MessagePart =
   | { type: 'text'; text: string }
   | { type: 'reasoning'; text: string }
@@ -125,12 +133,12 @@ export type SessionEvent =
   | { sessionId: string; type: 'message.complete'; messageId: string; message: ChatMessage }
   | { sessionId: string; type: 'session.status'; status: SessionStatus }
   | { sessionId: string; type: 'session.usage'; usage: Usage }
-  /** 逐轮推送：本次 LLM 请求的用量（≈当前上下文规模），供占用条实时刷新；区别于 session.usage 的会话累计值 */
-  | { sessionId: string; type: 'session.context'; usage: Usage }
   | { sessionId: string; type: 'permission.request'; request: PermissionRequest }
   | { sessionId: string; type: 'session.question'; request: QuestionRequest }
   | { sessionId: string; type: 'session.todo'; todos: TodoItem[] }
   | { sessionId: string; type: 'session.compacted'; message: ChatMessage }
+  /** 上下文仪表：下一次请求的规模（max(请求估算, 上次真实 usage)）+ 模型窗口；主进程权威口径 */
+  | { sessionId: string; type: 'session.context'; used: number; limit: number }
   | { sessionId: string; type: 'session.updated'; meta: SessionMeta };
 
 export interface AgentProvider {
@@ -143,6 +151,8 @@ export interface AgentProvider {
   stopSession(sessionId: string): Promise<void>;
   /** 手动压缩上下文：旧历史折叠为摘要 checkpoint（非破坏，旧消息保留）；返回是否实际压缩 */
   compactSession(sessionId: string): Promise<boolean>;
+  /** 当前上下文占用（切换会话时初始拉取；此后由 session.context 事件推送） */
+  getSessionContext(sessionId: string): Promise<SessionContext | null>;
   /** 订阅流式事件，返回取消订阅函数 */
   onEvent(cb: (ev: SessionEvent) => void): () => void;
   resolvePermission(request: PermissionRequest, decision: PermissionDecision): Promise<void>;

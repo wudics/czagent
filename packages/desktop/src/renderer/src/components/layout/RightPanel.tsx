@@ -1,11 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { CheckCircle2, FoldVertical } from 'lucide-react';
-import { usageTotal } from '@czagent/core';
 import { useSessionsStore } from '../../stores/sessions';
 import { useChatStore } from '../../stores/chat';
 import { useTodosStore } from '../../stores/todos';
-import { useSettingsStore } from '../../stores/settings';
 import { Badge } from '../ui/badge';
 import { Button } from '../ui/button';
 import { Dialog } from '../ui/dialog';
@@ -31,12 +29,10 @@ export function RightPanel() {
   const activeId = useSessionsStore((s) => s.activeId);
   const session = useSessionsStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const usage = useChatStore((s) => s.usage);
-  const contextUsage = useChatStore((s) => s.contextUsage);
-  const messages = useChatStore((s) => s.messages);
+  const context = useChatStore((s) => s.context);
   const replying = useChatStore((s) => s.replying);
   const compacting = useChatStore((s) => s.compacting);
   const compact = useChatStore((s) => s.compact);
-  const models = useSettingsStore((s) => s.settings.models);
   const todos = useTodosStore((s) => (activeId ? s.bySession[activeId] : undefined)) ?? [];
 
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -70,19 +66,10 @@ export function RightPanel() {
     setConfirmOpen(false);
   }, [activeId]);
 
-  // 上下文占用：优先逐轮 session.context 实时值（对话进行中每次 LLM 请求都刷新），
-  // 否则回退最近一条带 tokens 的 assistant 消息折算（与自动压缩判定同口径，含 cache）
-  const lastTokens =
-    contextUsage ??
-    (() => {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i]!;
-        if (m.role === 'assistant' && m.tokens) return m.tokens;
-      }
-      return null;
-    })();
-  const contextLimit = models.find((m) => m.id === session?.modelId)?.contextLimit ?? 0;
-  const contextUsed = lastTokens ? usageTotal(lastTokens) : null;
+  // 上下文占用：主进程权威口径（session.context 事件，含 system prompt/env/MCP 说明 + 模型窗口），
+  // open 时 IPC 初始拉取，随请求构建/回复落库/手动压缩实时刷新
+  const contextUsed = context?.used ?? null;
+  const contextLimit = context?.limit ?? 0;
   const contextPct = contextUsed !== null && contextLimit > 0 ? Math.min(100, (contextUsed / contextLimit) * 100) : null;
 
   const showNote = (kind: CompactNote['kind'], text: string): void => {
@@ -204,7 +191,7 @@ export function RightPanel() {
         {note && (
           <p
             className={cn(
-              'mt-1.5 break-all text-xs',
+              'mt-2.5 break-all text-xs',
               note.kind === 'ok' && 'text-emerald-600',
               note.kind === 'err' && 'text-red-500',
               note.kind === 'idle' && 'text-muted-foreground',

@@ -16,6 +16,7 @@ import type {
   PermissionRule,
   ProviderConfig,
   SendMessageInput,
+  SessionContext,
   SessionEvent,
   SessionMeta,
   SessionPatch,
@@ -60,6 +61,22 @@ function stripThinkTags(text: string): string {
 /** 联网开关（I16）：webAccess=false 的会话禁用的工具（主循环与子代理共用） */
 function webAccessDisabled(meta: SessionMeta | undefined): Set<string> {
   return meta?.webAccess === false ? new Set(['webfetch', 'websearch']) : new Set<string>();
+}
+
+/** 最近一条带 tokens 的 assistant 消息折算（持久化，跨 sendMessage 有效；上下文占用的真实口径之一） */
+function lastUsageTokens(history: ChatMessage[]): number {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i]!;
+    if (m.role === 'assistant' && m.tokens) return usageTotal(m.tokens);
+  }
+  return 0;
+}
+
+/** MCP 工具清单 → 注入 env 的说明块（与工具注入同源，保证上下文估算与请求一致） */
+function mcpNoteOf(tools: ToolDef[]): string {
+  return tools.length > 0
+    ? '\n\n<mcp_instructions>\n' + tools.map((t) => `- ${t.id}: ${t.description}`).join('\n') + '\n</mcp_instructions>'
+    : '';
 }
 
 export interface SessionManagerOptions {
@@ -609,7 +626,7 @@ export class SessionManager implements AgentProvider {
     // contextLimit 未知（<=0）或 auto 关闭时传极大预算：尾部预算钳到 15k + 条数上限 200，按此压缩
     const usable = this.compactionUsable(model, settings) ?? Number.MAX_SAFE_INTEGER;
     const controller = new AbortController();
-    return this.maybeCompact({
+    const ok = await this.maybeCompact({
       sessionId,
       settings,
       model,
@@ -618,6 +635,66 @@ export class SessionManager implements AgentProvider {
       history,
       usable,
     });
+    // 压缩成功 → 重算新窗口占用并推送，右侧面板百分比立即回落
+    if (ok) {
+      const ctx = await this.computeContext(sessionId);
+      if (ctx) this.emit({ sessionId, type: 'session.context', ...ctx });
+    }
+    return ok;
+  }
+
+  /** 当前上下文占用（切换会话时初始拉取；此后由各发射点推送 session.context 事件） */
+  async getSessionContext(sessionId: string): Promise<SessionContext | null> {
+    return this.computeContext(sessionId);
+  }
+
+  /**
+   * 计算当前上下文占用（含 system prompt/env/MCP 说明）。
+   * 窗口含 checkpoint 时上次真实 usage 口径失效（测量自压缩前更大的窗口），用纯请求估算；
+   * 无压缩历史（全量窗口）时用 max(估算, 上次真实 usage) 兜底启发式与真实 tokenizer 的偏差。
+   */
+  private async computeContext(sessionId: string): Promise<SessionContext | null> {
+    const session = this.opts.db.storage.getSession(sessionId);
+    if (!session) return null;
+    const settings = await this.opts.config.read();
+    const model = settings.models.find((m) => m.id === session.modelId);
+    if (!model) return null;
+    const agent = settings.agents.find((a) => a.id === session.agentId);
+    const cwd = session.cwd || homedir();
+    const history = pruneHistory(this.historyWindow(sessionId).messages);
+    const envBlock = await this.buildEnvBlock(cwd, agent, settings);
+    const mcpTools = await this.mcpToolsFor(cwd, agent, new Set<string>());
+    const requestMessages = buildRequestMessages(history, agent?.systemPrompt, envBlock + mcpNoteOf(mcpTools), model.vision !== false);
+    const est = estimateRequestTokens(requestMessages);
+    const used = this.lastCompactionIndex(history) >= 0 ? est : Math.max(est, lastUsageTokens(history));
+    return { used, limit: model.contextLimit ?? 0 };
+  }
+
+  /** 请求 env 块：平台/工作目录/日期 + 可用技能清单（runLoop 与上下文估算共用，保证口径一致） */
+  private async buildEnvBlock(cwd: string, agent: AgentDef | undefined, settings: Settings): Promise<string> {
+    let envBlock = `当前系统平台：${process.platform} (${process.arch})\n会话工作目录：${cwd}\n当前日期：${new Date().toISOString().slice(0, 10)}`;
+    // 技能发现：有技能则注入 <available_skills>，agent 按需用 skill 工具加载
+    // I13.3：逐条(skillOverrides) + 全局禁用名单，取 load(s)
+    try {
+      const disabledSkills = settings.general.disabledSkills ?? [];
+      const skills = (await scanSkills(cwd, this.opts.builtinSkillsDir)).filter((s) => skillEnabled(s.name, agent, disabledSkills));
+      if (skills.length > 0) {
+        envBlock +=
+          '\n\n<available_skills>\n' +
+          skills.map((s) => `- ${s.name}: ${s.description}`).join('\n') +
+          '\n</available_skills>\n当任务与上述技能描述匹配时，先用 skill 工具（{name}）加载其完整说明，再按说明行动。';
+      }
+    } catch {
+      // 技能扫描失败不影响会话
+    }
+    return envBlock;
+  }
+
+  /** MCP 工具清单：按 agent 生效服务器名单（全开=全局 enabled 且非 off；受限=点名 on），剔除运行中禁用项 */
+  private async mcpToolsFor(cwd: string, agent: AgentDef | undefined, disabled: Set<string>): Promise<ToolDef[]> {
+    const allowedServers = this.allowedMcpServers(cwd, agent);
+    if (allowedServers.length === 0) return [];
+    return (await this.mcp.getTools(cwd, this.opts.globalMcpDir, allowedServers)).filter((t) => !disabled.has(t.id));
   }
 
   /** 占用槽位运行 runLoop；结束时释放槽位并接力队列 */
@@ -1417,21 +1494,7 @@ export class SessionManager implements AgentProvider {
     // 步数未设置（留空）= 不限步数（与设置界面"留空=不限"一致）；显式填写 >0 数字才生效
     const maxSteps = agent?.steps && agent.steps > 0 ? agent.steps : Number.POSITIVE_INFINITY;
     const cwd = session.cwd || homedir();
-    let envBlock = `当前系统平台：${process.platform} (${process.arch})\n会话工作目录：${cwd}\n当前日期：${new Date().toISOString().slice(0, 10)}`;
-    // 技能发现（每次 runLoop 扫描一次）：有技能则注入 <available_skills>，agent 按需用 skill 工具加载
-    // I13.3：逐条(skillOverrides) + 全局禁用名单，取 load(s)
-    try {
-      const disabledSkills = settings.general.disabledSkills ?? [];
-      const skills = (await scanSkills(cwd, this.opts.builtinSkillsDir)).filter((s) => skillEnabled(s.name, agent, disabledSkills));
-      if (skills.length > 0) {
-        envBlock +=
-          '\n\n<available_skills>\n' +
-          skills.map((s) => `- ${s.name}: ${s.description}`).join('\n') +
-          '\n</available_skills>\n当任务与上述技能描述匹配时，先用 skill 工具（{name}）加载其完整说明，再按说明行动。';
-      }
-    } catch {
-      // 技能扫描失败不影响会话
-    }
+    const envBlock = await this.buildEnvBlock(cwd, agent, settings);
 
     let providerUsage: Usage | undefined;
     let lastAssistantId: string | null = null;
@@ -1466,34 +1529,19 @@ export class SessionManager implements AgentProvider {
         const turnProfile = getBuiltinProfile(turnProvider.id) ?? createGenericProfile(turnProvider.baseUrl);
         const turnThinking = current?.thinkingMode ?? session.thinkingMode;
         // MCP 工具并入：按 agent 生效服务器名单（全开=全局 enabled 且非 off；受限=点名 on）
-        let mcpTools: ToolDef[] = [];
-        const allowedServers = this.allowedMcpServers(cwd, turnAgent);
-        if (allowedServers.length > 0) {
-          mcpTools = (await this.mcp.getTools(cwd, this.opts.globalMcpDir, allowedServers)).filter((t) => !disabled.has(t.id));
-        }
+        const mcpTools = await this.mcpToolsFor(cwd, turnAgent, disabled);
         const tools = baseTools.concat(mcpTools);
-        const mcpNote =
-          mcpTools.length > 0
-            ? '\n\n<mcp_instructions>\n' + mcpTools.map((t) => `- ${t.id}: ${t.description}`).join('\n') + '\n</mcp_instructions>'
-            : '';
+        const mcpNote = mcpNoteOf(mcpTools);
         const canTool = turnModel.toolcall !== false;
         // 上下文压缩：溢出检测（估算 ∨ 上次真实 usage）→ 摘要 checkpoint → 仍超限丢最旧重试 ≤1；
         // contextLimit<=0 / auto=false 时跳过；工具输出持续 prune（请求侧，DB 不动）
         const compactUsable = this.compactionUsable(turnModel, settings);
-        // 上次请求的上下文规模：取最近一条带 tokens 的 assistant 消息（持久化，跨 sendMessage 有效）
-        const lastUsageOf = (hs: ChatMessage[]): number => {
-          for (let i = hs.length - 1; i >= 0; i--) {
-            const m = hs[i]!;
-            if (m.role === 'assistant' && m.tokens) return usageTotal(m.tokens);
-          }
-          return 0;
-        };
         const window0 = this.historyWindow(sessionId);
         let history = pruneHistory(window0.messages);
         // 窗口饱和（>300 条且窗口内无可见 checkpoint）→ 即使 token 未超预算也强制压缩，避免历史被静默丢弃
         const saturationCompact = window0.saturated && settings.general.compaction.auto;
         let requestMessages = buildRequestMessages(history, turnAgent?.systemPrompt, envBlock + mcpNote, turnModel.vision !== false);
-        let est = Math.max(estimateRequestTokens(requestMessages), lastUsageOf(history));
+        let est = Math.max(estimateRequestTokens(requestMessages), lastUsageTokens(history));
         if ((compactUsable !== null && est >= compactUsable) || saturationCompact) {
           // 饱和触发的压缩不依赖 token 预算：usable 传极大值（尾部预算钳到 15k + 条数上限 200）
           await this.maybeCompact({
@@ -1507,7 +1555,7 @@ export class SessionManager implements AgentProvider {
           });
           history = pruneHistory(this.historyWindow(sessionId).messages);
           requestMessages = buildRequestMessages(history, turnAgent?.systemPrompt, envBlock + mcpNote, turnModel.vision !== false);
-          est = Math.max(estimateRequestTokens(requestMessages), lastUsageOf(history));
+          est = Math.max(estimateRequestTokens(requestMessages), lastUsageTokens(history));
           if (compactUsable !== null && est >= compactUsable) {
             const start = this.lastCompactionIndex(history) === 0 ? 1 : 0;
             if (start < history.length) {
@@ -1517,6 +1565,11 @@ export class SessionManager implements AgentProvider {
             }
           }
         }
+        // 上下文仪表：复用本轮请求估算（含 system prompt/env/MCP 说明），零额外计算；
+        // 窗口含 checkpoint 时上次真实 usage 口径失效（测量自压缩前更大的窗口），改用纯估算。
+        // 溢出检测用的 est 保持 max 混合口径，不受影响
+        const gaugeUsed = this.lastCompactionIndex(history) >= 0 ? estimateRequestTokens(requestMessages) : est;
+        this.emit({ sessionId, type: 'session.context', used: gaugeUsed, limit: turnModel.contextLimit ?? 0 });
         const request: ChatStreamRequest = {
           baseUrl: turnProfile.baseUrl,
           apiKey: turnProvider.apiKey,
@@ -1579,8 +1632,8 @@ export class SessionManager implements AgentProvider {
                 turnFinish = ev.finishReason;
                 if (ev.usage) {
                   providerUsage = ev.usage;
-                  // 逐轮落库+广播：Token 统计/占用条随每次 LLM 请求实时刷新，不再等整轮结束
-                  this.reportUsage(sessionId, turnModel.id, ev.usage, true);
+                  // 逐轮落库+广播：Token 统计随每次 LLM 请求实时刷新，不再等整轮结束
+                  this.reportUsage(sessionId, turnModel.id, ev.usage);
                 }
                 break;
               case 'error':
@@ -1853,15 +1906,14 @@ export class SessionManager implements AgentProvider {
   }
 
   /**
-   * 逐轮用量上报：落库 + 广播累计总量（session.usage，"Token 消耗"块实时刷新）；
-   * emitContext 时再广播本次请求用量（session.context，占用条实时刷新，仅主循环——子代理请求不代表主会话上下文）。
+   * 逐轮用量上报：落库 + 广播累计总量（session.usage，"Token 消耗"块实时刷新）。
+   * 上下文占用改由 runLoop/finalize/compact 的 session.context 发射点推送（权威口径含 system prompt 与 limit）。
    */
-  private reportUsage(sessionId: string, modelId: string, usage: Usage, emitContext = false): void {
+  private reportUsage(sessionId: string, modelId: string, usage: Usage): void {
     const storage = this.opts.db.storage;
     storage.appendUsage(sessionId, modelId, usage);
     const total = storage.getUsage(sessionId);
     if (total) this.emit({ sessionId, type: 'session.usage', usage: total });
-    if (emitContext) this.emit({ sessionId, type: 'session.context', usage });
   }
 
   private async finalizeMessage(
@@ -1900,6 +1952,14 @@ export class SessionManager implements AgentProvider {
     storage.updateSessionStatus(sessionId, 'idle');
     const total = storage.getUsage(sessionId);
     if (total) this.emit({ sessionId, type: 'session.usage', usage: total });
+    // 上下文仪表：轻量口径（API input 已含 system prompt/工具定义，usageTotal 即本次请求规模）
+    try {
+      const cfg = await this.opts.config.read();
+      const fm = cfg.models.find((m) => m.id === session?.modelId);
+      this.emit({ sessionId, type: 'session.context', used: usageTotal(usage), limit: fm?.contextLimit ?? 0 });
+    } catch {
+      // 上下文推送失败不影响落库
+    }
     this.emit({ sessionId, type: 'message.complete', messageId, message });
     this.emit({ sessionId, type: 'session.status', status: 'idle' });
   }

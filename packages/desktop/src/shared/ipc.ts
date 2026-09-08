@@ -15,6 +15,7 @@ export const IPC = {
     stop: 'session:stop',
     usage: 'session:usage',
     compact: 'session:compact',
+    context: 'session:context',
   },
   todo: {
     get: 'todo:get',

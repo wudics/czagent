@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Globe, Paperclip, Play, Send, Square } from 'lucide-react';
-import { getProvider, type ThinkingMode } from '@czagent/core';
+import { getProvider, implMetaOf, type ThinkingMode } from '@czagent/core';
 import { useSessionsStore } from '../../stores/sessions';
 import { useChatStore } from '../../stores/chat';
 import { useSettingsStore } from '../../stores/settings';
@@ -38,13 +38,12 @@ export function InputBar() {
   const replying = session?.status === 'running' || session?.status === 'queued';
   const send = useChatStore((s) => s.send);
   const stop = useChatStore((s) => s.stop);
-  const allModels = useSettingsStore((s) => s.settings.models);
-  const providers = useSettingsStore((s) => s.settings.providers);
-  const chatModels = useMemo(
-    () => allModels.filter((m) => m.capability === 'chat' && m.enabled),
-    [allModels],
-  );
-  const providerName = (id: string): string => providers.find((p) => p.id === id)?.name ?? id;
+  // selector 只选稳定引用（settings），派生数组在组件内 useMemo —— selector 内 filter 每次产生新引用会导致 useSyncExternalStore 无限重渲染
+  const chatSettings = useSettingsStore((s) => s.settings);
+  const chatModels = useMemo(() => chatSettings.chatModels.filter((m) => m.enabled), [chatSettings.chatModels]);
+  // 会话模型解析回退链：会话自身 id → chat 绑定 → 第一个启用模型；'' = 未配置
+  const resolveChatModelId = useSettingsStore((s) => s.resolveChatModelId);
+  const resolvedModelId = resolveChatModelId(session?.modelId);
 
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
@@ -137,7 +136,7 @@ export function InputBar() {
       <div className="mb-2 flex items-center gap-2">
         <Select
           className="h-7 w-48"
-          value={session?.modelId ?? ''}
+          value={resolvedModelId}
           disabled={!session}
           aria-label={t('newSession.model')}
           title={t('newSession.model')}
@@ -145,12 +144,10 @@ export function InputBar() {
             if (activeId) void patch(activeId, { modelId: e.target.value });
           }}
         >
-          {session?.modelId && !chatModels.some((m) => m.id === session.modelId) && (
-            <option value={session.modelId}>{session.modelId}</option>
-          )}
+          {!resolvedModelId && <option value="">{t('settings.models.unbound')}</option>}
           {chatModels.map((m) => (
             <option key={m.id} value={m.id}>
-              {m.name}（{providerName(m.provider)}）
+              {m.displayName}（{implMetaOf(m.implId)?.name ?? m.implId}）
             </option>
           ))}
         </Select>

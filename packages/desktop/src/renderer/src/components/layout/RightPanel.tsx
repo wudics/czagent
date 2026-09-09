@@ -3,10 +3,12 @@ import { useTranslation } from 'react-i18next';
 import { CheckCircle2, FoldVertical } from 'lucide-react';
 import { useSessionsStore } from '../../stores/sessions';
 import { useChatStore } from '../../stores/chat';
+import { useSettingsStore } from '../../stores/settings';
 import { useTodosStore } from '../../stores/todos';
 import { Badge } from '../ui/badge';
 import { Button } from '../ui/button';
 import { Dialog } from '../ui/dialog';
+import { ModelName } from './ModelName';
 import { cn } from '../../lib/utils';
 
 function InfoRow({ label, children }: { label: string; children: React.ReactNode }) {
@@ -28,6 +30,7 @@ export function RightPanel() {
   const { t } = useTranslation();
   const activeId = useSessionsStore((s) => s.activeId);
   const session = useSessionsStore((s) => s.sessions.find((x) => x.id === s.activeId));
+  const agents = useSettingsStore((s) => s.settings.agents);
   const usage = useChatStore((s) => s.usage);
   const context = useChatStore((s) => s.context);
   const replying = useChatStore((s) => s.replying);
@@ -111,10 +114,14 @@ export function RightPanel() {
           </Badge>
         </InfoRow>
         <InfoRow label={t('panel.agents')}>
-          <span className="capitalize">{session.agentId}</span>
+          {/* agent 已删除时只剩 id；名称与 id 同时展示便于脚本 ctx.agent.run 按其一引用 */}
+          <span className="break-all">
+            {agents.find((a) => a.id === session.agentId)?.name ?? session.agentId}
+            <span className="ml-1.5 text-[11px] text-muted-foreground">{session.agentId}</span>
+          </span>
         </InfoRow>
         <InfoRow label={t('panel.model')}>
-          <span className="break-all">{session.modelId}</span>
+          <ModelName id={session.modelId} />
         </InfoRow>
         <InfoRow label={t('panel.thinking')}>{t(`thinkingModes.${session.thinkingMode}`)}</InfoRow>
         <InfoRow label={t('panel.cwd')}>

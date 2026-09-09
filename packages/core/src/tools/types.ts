@@ -1,14 +1,20 @@
 import type { PermissionDecision, PermissionRequest, Settings } from '../provider.js';
+import type { Gateway } from '../llm/gateway.js';
 
 export interface ToolContext {
   sessionId: string;
   cwd: string;
   settings: Settings;
+  /** LLM 网关：多模态能力调用统一入口（embed/图像/视频/TTS/ASR 等，内含绑定解析与校验） */
+  gateway: Gateway;
   signal: AbortSignal;
   /** 会话临时目录根（webfetch 等大结果落盘用；会话删除时整体清理） */
   tempDir?: string;
   /** 内置技能目录根（skill 工具发现用；由主进程注入打包资源） */
   builtinSkillsDir?: string;
+  /** 技能白名单（I19）：传入时 skill 工具只认名单内技能（脚本 ctx.use / ctx.agent.run skills 的权威覆盖）；
+   *  缺省 = 跟随全局 disabledSkills 过滤 */
+  allowedSkills?: string[];
   /** 工具执行进度上报（更新当前工具卡片标题；长任务如视频生成轮询用） */
   reportProgress?: (text: string) => void;
   /** 切换会话 agent（plan-exit 用；由 SessionManager 注入） */

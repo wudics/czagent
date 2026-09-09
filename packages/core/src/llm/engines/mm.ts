@@ -1,11 +1,11 @@
-/** 适配层共享 HTTP/解析工具。postJson 失败抛 HttpError（status + 响应体前 300 字符）。 */
+/** 多模态引擎共享 HTTP/解析工具。postJson 失败抛 HttpError（status + 响应体前 300 字符）。 */
 import type { GenImage } from './types.js';
 
 export const IMAGE_TIMEOUT_MS = 360_000; // Agnes 官方建议 60–360s
 export const VIDEO_POLL_INTERVAL_MS = 2_000;
 export const MAX_GENERATED_BYTES = 64 * 1024 * 1024;
 
-/** 带 HTTP 状态码的错误（profile 探测/重试逻辑按状态码分流） */
+/** 带 HTTP 状态码的错误（探测/重试逻辑按状态码分流） */
 export class HttpError extends Error {
   constructor(
     public readonly status: number,

@@ -2,17 +2,16 @@ import type { MessagePart, PermissionRequest, ThinkingMode } from '@czagent/core
 
 export interface MockModelDef {
   id: string;
-  name: string;
-  provider: string;
-  capability: string;
+  displayName: string;
+  implId: string;
 }
 
 export const MOCK_MODELS: MockModelDef[] = [
-  { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', provider: 'deepseek', capability: 'chat' },
-  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', provider: 'deepseek', capability: 'chat' },
-  { id: 'siliconflow-deepseek-v4', name: 'SiliconFlow DeepSeek V4', provider: 'siliconflow', capability: 'chat' },
-  { id: 'agnes-2.5-flash', name: 'Agnes 2.5 Flash', provider: 'agnes', capability: 'chat' },
-  { id: 'agnes-2.5-pro', name: 'Agnes 2.5 Pro', provider: 'agnes', capability: 'chat' },
+  { id: 'mdl-deepseek-v4-pro', displayName: 'DeepSeek V4 Pro', implId: 'deepseek' },
+  { id: 'mdl-deepseek-v4-flash', displayName: 'DeepSeek V4 Flash', implId: 'deepseek' },
+  { id: 'mdl-qwen3-32b', displayName: 'Qwen3 32B（SiliconFlow）', implId: 'siliconflow' },
+  { id: 'mdl-agnes-2-5-flash', displayName: 'Agnes 2.5 Flash', implId: 'agnes' },
+  { id: 'mdl-agnes-2-5-pro', displayName: 'Agnes 2.5 Pro', implId: 'agnes' },
 ];
 
 export const MOCK_THINKING_MODES = [

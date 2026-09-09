@@ -65,21 +65,23 @@
 
 > 契约参考 `packages/llm/src/schema/events.ts`：总量字段是"含缓存含 reasoning 的总口径"（`input = nonCached + cacheRead + cacheWrite`），各分解字段独立存储，消费端不需要做减法。
 
-### 2.4 `model_configs` 模型覆盖表（决策 5）
+### 2.4 模型配置（config.json，非 sqlite；决策 5 修订）
 
-用户通过设置界面增改的模型覆盖，优先级高于内置目录。
+> 历史注：本节曾规划 sqlite `model_configs` 表，实际从未落地。模型配置现随 Settings 整体持久化于 `userData/config.json`（`ConfigStore`），不存在对应 sqlite 表。
 
-| 列 | 类型 | 说明 |
-|---|---|---|
-| id | TEXT PK | 模型 id（如 `deepseek-v4-pro`） |
-| provider | TEXT | deepseek \| siliconflow \| agnes \| openai-compatible |
-| capability | TEXT | chat/embedding/rerank/image-understanding/...（能力 taxonomy 见 llm-engine.md） |
-| base_url | TEXT NULL | 覆盖平台 baseURL（自定义厂商） |
-| api_key_ref | TEXT | 引用配置中的 key 字段（不存明文于本表） |
-| params | TEXT | JSON：temperature、thinking 默认、top_p 等 |
-| limit | TEXT | JSON：`{ context, maxOutput }` |
-| enabled | INTEGER | 是否在 UI 可选用 |
-| sort | INTEGER | 展示顺序 |
+模型为中心的配置结构（旧 `providers`/`models` 结构启动时检测并重置为空，其余设置保留）：
+
+```ts
+interface Settings {
+  chatModels: ChatModelConfig[]          // 对话模型：id(自动 mdl-*)/displayName/implId/baseUrl/apiKey/modelName/contextLimit/maxOutput/enabled/toolcall/vision/options
+  multimodalModels: MultimodalModelConfig[] // 多模态与专用模型：多 capability/implId/baseUrl/apiKey/modelName/options/enabled
+  bindings: CapabilityBinding[]          // 能力 → 模型 id
+  agents / permissions / general
+}
+```
+
+- `implId` 指向代码内置的接口实现注册表（`llm/engines/index.ts`）：chat 为 deepseek / siliconflow / agnes / bigmodel / qwen / openrouter / openai-compatible（兜底）；多模态按能力各有针对性实现 + OpenAI 兼容兜底。元数据（显示名/默认地址/适用能力）在 `llm/engines/catalog.ts`（纯，渲染层直引）。
+- 解析与校验统一收敛于 `llm/gateway.ts`（唯一入口）；未注册/未配置 Key 主动中文报错，不发未知请求。
 
 ### 2.5 `attachments` 附件表
 

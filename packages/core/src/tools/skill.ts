@@ -16,8 +16,12 @@ export const skillTool: ToolDef = {
   async execute(input, ctx: ToolContext) {
     const name = String(input.name ?? '').trim();
     if (!name) throw new Error('缺少 name 参数');
-    const disabledSkills = new Set(ctx.settings.general.disabledSkills ?? []);
-    const skills = (await scanSkills(ctx.cwd, ctx.builtinSkillsDir)).filter((s) => !disabledSkills.has(s.name));
+    // allowedSkills（I19）：脚本 ctx.use / agent.run skills 的权威覆盖——只认名单内技能；
+    // 缺省跟随全局 disabledSkills
+    const allowed = ctx.allowedSkills;
+    const skills = (await scanSkills(ctx.cwd, ctx.builtinSkillsDir)).filter((s) =>
+      allowed ? allowed.includes(s.name) : !(ctx.settings.general.disabledSkills ?? []).includes(s.name),
+    );
     const skill = skills.find((s) => s.name === name);
     if (!skill) {
       throw new Error(`未找到技能：${name}（可用：${skills.map((s) => s.name).join('、') || '无'}）`);

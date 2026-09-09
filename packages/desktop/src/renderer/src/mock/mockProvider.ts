@@ -32,7 +32,7 @@ function seedMeta(partial: Partial<SessionMeta> & { id: string }): SessionMeta {
     mode: 'chat',
     agentId: 'build',
     cwd: MOCK_CWD,
-    modelId: 'deepseek-v4-pro',
+    modelId: 'mdl-deepseek-v4-pro',
     thinkingMode: 'on',
     status: 'idle',
     webAccess: true,
@@ -216,10 +216,10 @@ export class MockProvider implements AgentProvider {
 
   constructor() {
     this.sessions = [
-      seedMeta({ id: 's-demo-plan', title: '项目规划讨论', status: 'idle', modelId: 'deepseek-v4-pro' }),
-      seedMeta({ id: 's-demo-code', title: '代码重构演示', status: 'idle', modelId: 'siliconflow-deepseek-v4' }),
+      seedMeta({ id: 's-demo-plan', title: '项目规划讨论', status: 'idle', modelId: 'mdl-deepseek-v4-pro' }),
+      seedMeta({ id: 's-demo-code', title: '代码重构演示', status: 'idle', modelId: 'mdl-qwen3-32b' }),
       seedMeta({ id: 's-long', title: '长历史会话（分页演示）', status: 'idle', thinkingMode: 'off' }),
-      seedMeta({ id: 's-script', title: '脚本编排示例', mode: 'script', agentId: 'plan', modelId: 'agnes-2.5-flash' }),
+      seedMeta({ id: 's-script', title: '脚本编排示例', mode: 'script', agentId: 'plan', modelId: 'mdl-agnes-2-5-flash' }),
     ];
   }
 
@@ -235,7 +235,7 @@ export class MockProvider implements AgentProvider {
 
   async createSession(input: CreateSessionInput): Promise<SessionMeta> {
     const settings = loadSettings();
-    const defaultChat = settings.models.find((m) => m.capability === 'chat' && m.enabled)?.id ?? MOCK_MODELS[0]!.id;
+    const defaultChat = settings.chatModels.find((m) => m.enabled)?.id ?? MOCK_MODELS[0]!.id;
     const meta = seedMeta({
       id: nextId('s'),
       title: input.title ?? '新会话',
@@ -391,7 +391,9 @@ export class MockProvider implements AgentProvider {
 
   /** 模型上下文窗口（0 = 未知），按当前设置解析 */
   private contextLimitOf(modelId: string): number {
-    return loadSettings().models.find((m) => m.id === modelId)?.contextLimit ?? 0;
+    const s = loadSettings();
+    const m = s.chatModels.find((x) => x.id === modelId) ?? s.multimodalModels.find((x) => x.id === modelId);
+    return m && 'contextLimit' in m ? (m.contextLimit ?? 0) : 0;
   }
 
   /** 记录并推送上下文占用（回复完成 / 手动压缩后调用） */

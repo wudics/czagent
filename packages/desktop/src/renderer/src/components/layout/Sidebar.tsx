@@ -9,6 +9,7 @@ import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
 import { Badge } from '../ui/badge';
 import { NewSessionDialog } from './NewSessionDialog';
+import { ModelName } from './ModelName';
 
 function StatusDot({ status }: { status: SessionMeta['status'] }) {
   if (status === 'running') {
@@ -74,7 +75,7 @@ function SessionRow({ session, active }: { session: SessionMeta; active: boolean
           {hasPending && (
             <span className="shrink-0 whitespace-nowrap font-medium text-amber-500">{t('sidebar.pendingConfirm')}</span>
           )}
-          <span className="min-w-0 truncate">{session.modelId}</span>
+          <ModelName id={session.modelId} />
         </div>
       </div>
       {confirming ? (

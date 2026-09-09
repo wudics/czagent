@@ -1,29 +1,34 @@
-import type { ChatStreamRequest, LLMEvent } from './types.js';
-import { LLMError, classifyHttpError } from './errors.js';
-import { parseSse } from './sse.js';
-import { normalizeUsage } from './usage.js';
+/**
+ * OpenAI 兼容 chat 协议原语（各 chat 引擎共享的底层机制，非任何一家专属）：
+ * 消息/请求体组装、SSE 流 → LLMEvent。各引擎文件内只写自己的差异
+ * （thinking 参数、reasoning 字段名等），通过参数注入。
+ */
+import type { ThinkingMode } from '../../provider.js';
+import { LLMError } from '../errors.js';
+import { parseSse } from '../sse.js';
+import { normalizeUsage } from '../usage.js';
+import type { ChatBinding, ChatReq, ChatEngine, LLMChatMessage, LLMEvent } from '../types.js';
+import { fetchJsonWithRetry } from './http.js';
 
-const MAX_RETRIES = 2;
+export const OPENAI_CHAT_PATH = '/chat/completions';
 
-function parseRetryAfter(header: string | null): number | undefined {
-  if (!header) return undefined;
-  const sec = Number(header);
-  if (!Number.isNaN(sec)) return Math.max(0, sec) * 1000;
-  const date = Date.parse(header);
-  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
-  return undefined;
+export interface OpenAiChatOptions {
+  /** 流式 delta 中承载思考内容的字段（默认 reasoning_content） */
+  reasoningField?: string;
+  /** 回传历史 assistant 思考内容时使用的字段 */
+  reasoningMessageField?: string;
+  /** 是否必须回传 reasoning（DeepSeek 工具场景 400 规则） */
+  reasoningPassthrough?: boolean;
+  /** 思考模式 → 追加到请求体的参数（写死在各自引擎文件内） */
+  thinkingParams(mode: ThinkingMode): Record<string, unknown> | undefined;
 }
 
-function backoffMs(attempt: number): number {
-  return 500 * 2 ** attempt + Math.random() * 200;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function buildBody(request: ChatStreamRequest): Record<string, unknown> {
-  const messages = request.messages.map((m) => {
+/** 业务消息 → OpenAI 格式 messages 数组（图片 content 块、assistant reasoning/toolCalls 回传、tool 配对） */
+export function buildOpenAiMessages(
+  messages: LLMChatMessage[],
+  opts: { reasoningMessageField?: string; reasoningPassthrough?: boolean } = {},
+): Record<string, unknown>[] {
+  return messages.map((m) => {
     const base: Record<string, unknown> = { role: m.role, content: m.content ?? null };
     if (m.role === 'user' && m.images && m.images.length > 0) {
       base.content = [
@@ -32,8 +37,8 @@ function buildBody(request: ChatStreamRequest): Record<string, unknown> {
       ];
     }
     if (m.role === 'assistant') {
-      if (m.reasoning && request.reasoningPassthrough) {
-        base[request.reasoningMessageField ?? 'reasoning_content'] = m.reasoning;
+      if (m.reasoning && opts.reasoningPassthrough) {
+        base[opts.reasoningMessageField ?? 'reasoning_content'] = m.reasoning;
       }
       if (m.toolCalls && m.toolCalls.length > 0) {
         base.tool_calls = m.toolCalls.map((tc) => ({
@@ -47,62 +52,25 @@ function buildBody(request: ChatStreamRequest): Record<string, unknown> {
     }
     return base;
   });
-  return {
-    model: request.model,
-    messages,
+}
+
+/** 组装 OpenAI 兼容 chat 请求体并发出（自动重试）；各引擎在 thinkingParams 里注入差异 */
+export async function openAiChatFetch(b: ChatBinding, req: ChatReq, opts: OpenAiChatOptions): Promise<Response> {
+  const body: Record<string, unknown> = {
+    model: b.modelName,
+    messages: buildOpenAiMessages(req.messages, opts),
     stream: true,
     stream_options: { include_usage: true },
-    ...(request.maxTokens ? { max_tokens: request.maxTokens } : {}),
-    ...(request.thinkingParams?.(request.thinking) ?? {}),
-    ...(request.tools && request.tools.length > 0 ? { tools: request.tools } : {}),
-    ...request.options,
+    ...(req.maxTokens ? { max_tokens: req.maxTokens } : {}),
+    ...(opts.thinkingParams(req.thinking) ?? {}),
+    ...(req.tools && req.tools.length > 0 ? { tools: req.tools } : {}),
+    ...req.options,
   };
+  return fetchJsonWithRetry(`${b.baseUrl}${OPENAI_CHAT_PATH}`, body, b.apiKey, req.signal);
 }
 
-async function fetchOnce(request: ChatStreamRequest, attempt: number): Promise<Response> {
-  const url = `${request.baseUrl}${request.path ?? '/chat/completions'}`;
-  const body = JSON.stringify(buildBody(request));
-
-  let res: Response;
-  try {
-    res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${request.apiKey}`,
-        ...request.headers,
-      },
-      body,
-      signal: request.signal,
-    });
-  } catch (err) {
-    if (request.signal?.aborted) throw new LLMError('cancelled', '已取消', {});
-    const e = new LLMError('network', String((err as Error)?.message ?? err), { retryable: true });
-    if (attempt < MAX_RETRIES) {
-      await sleep(backoffMs(attempt));
-      return fetchOnce(request, attempt + 1);
-    }
-    throw e;
-  }
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    const retryAfter = parseRetryAfter(res.headers.get('retry-after'));
-    const err = classifyHttpError(res.status, text, retryAfter);
-    if (err.retryable && attempt < MAX_RETRIES) {
-      await sleep(err.retryAfterMs ?? backoffMs(attempt));
-      return fetchOnce(request, attempt + 1);
-    }
-    throw err;
-  }
-  return res;
-}
-
-/**
- * 统一 Chat 流：请求 OpenAI 兼容 chat/completions，产出 LLMEvent 事件流。
- */
-export async function* streamChat(request: ChatStreamRequest): AsyncGenerator<LLMEvent> {
-  const res = await fetchOnce(request, 0);
+/** 消费 OpenAI 兼容 SSE 流 → LLMEvent（tool-call 增量聚合、usage 归一化、finish 即断流） */
+export async function* consumeOpenAiStream(res: Response, signal: AbortSignal | undefined, reasoningField = 'reasoning_content'): AsyncGenerator<LLMEvent> {
   if (!res.body) throw new LLMError('network', '响应无 body', {});
 
   const cancelBody = (): void => {
@@ -116,7 +84,7 @@ export async function* streamChat(request: ChatStreamRequest): AsyncGenerator<LL
   let callSeq = 0;
   try {
     const pendingTools = new Map<number, { callID: string; tool: string; input: string; announced: boolean }>();
-    for await (const data of parseSse(res.body, request.signal)) {
+    for await (const data of parseSse(res.body, signal)) {
       let chunk: Record<string, any>;
       try {
         chunk = JSON.parse(data) as Record<string, any>;
@@ -126,7 +94,6 @@ export async function* streamChat(request: ChatStreamRequest): AsyncGenerator<LL
       const choice = chunk?.choices?.[0];
       if (choice) {
         const delta = choice.delta ?? {};
-        const reasoningField = request.reasoningField ?? 'reasoning_content';
         if (typeof delta[reasoningField] === 'string' && delta[reasoningField]) {
           yield { type: 'reasoning-delta', text: delta[reasoningField] };
         }
@@ -192,7 +159,15 @@ export async function* streamChat(request: ChatStreamRequest): AsyncGenerator<LL
     }
   } catch (err) {
     if (err instanceof LLMError) throw err;
-    if (request.signal?.aborted) throw new LLMError('cancelled', '已取消', {});
+    if (signal?.aborted) throw new LLMError('cancelled', '已取消', {});
     throw new LLMError('unknown', String((err as Error)?.message ?? err), {});
   }
 }
+
+/** 组装 + 请求 + 消费的通用管道：各 chat 引擎只需提供自己的差异参数 */
+export async function* streamOpenAiChat(b: ChatBinding, req: ChatReq, opts: OpenAiChatOptions): AsyncGenerator<LLMEvent> {
+  const res = await openAiChatFetch(b, req, opts);
+  yield* consumeOpenAiStream(res, req.signal, opts.reasoningField ?? 'reasoning_content');
+}
+
+export type { ChatEngine };

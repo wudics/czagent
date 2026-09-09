@@ -113,6 +113,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       hasMoreTop: page.hasMore,
       replying: meta?.status === 'running' || meta?.status === 'queued',
     });
+    // 悬空 modelId 自动修复（模型被删除/配置重置后的旧会话）：按解析回退链落库，
+    // 使主循环直接解析成功；未配置任何模型时不动（显示层显示"未配置"）
+    const st = useSettingsStore.getState();
+    if (st.loaded && meta?.modelId) {
+      const resolved = st.resolveChatModelId(meta.modelId);
+      if (resolved && resolved !== meta.modelId) await useSessionsStore.getState().patch(sessionId, { modelId: resolved });
+    }
     const usage = await getProvider().getUsage(sessionId);
     let context: SessionContext | null = null;
     try {

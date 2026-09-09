@@ -17,12 +17,12 @@ czagent/
 │   │   │   ├── index.ts            # 对外出口（Provider 契约、SessionManager、类型）
 │   │   │   ├── provider.ts         # ★ Provider 契约（渲染层唯一依赖的接口）
 │   │   │   ├── llm/                # 协议引擎
-│   │   │   │   ├── transport.ts    # HTTP transport + SSE 解析
-│   │   │   │   ├── events.ts       # LLMEvent 统一事件模型
-│   │   │   │   ├── errors.ts       # 错误分类/重试/脱敏
+│   │   │   │   ├── gateway.ts      # ★ 唯一入口：解析/校验/路由（ResolvedChat 扁平视图）
+│   │   │   │   ├── types.ts        # ChatBinding / ChatReq / ChatEngine / LLMEvent
+│   │   │   │   ├── errors.ts       # 错误分类/脱敏
+│   │   │   │   ├── sse.ts          # SSE 解析
 │   │   │   │   ├── usage.ts        # usage 归一化与计费
-│   │   │   │   ├── catalog.ts      # 内置模型目录（三家默认）
-│   │   │   │   └── providers/      # deepseek / siliconflow / agnes / openai-compatible
+│   │   │   │   └── engines/        # 每家独立引擎：chat/*（deepseek 等）+ 多模态按能力 + catalog/index 注册表
 │   │   │   ├── agent/              # 主循环、agent 定义、build/plan 提示词、plan 工具
 │   │   │   ├── session/            # SessionManager、会话运行态、compaction、消息模型
 │   │   │   ├── tools/              # 工具注册表 + 内置工具
@@ -140,5 +140,5 @@ SessionEvent =
 
 1. **统一事件流收敛**：无论哪家厂商、哪个能力（chat/embedding/rerank/图像/视频），协议层最终产出统一的 `LLMEvent` 流，下游无感知。opencode 双运行时（AI SDK / 原生）最终都收敛到 `@opencode-ai/llm` 的 `LLMEvent`。
 2. **增量持久化**：流式过程中每个 part 增量落库（text/reasoning/tool-call/tool-result），窗口刷新即得最新状态，崩溃可恢复。
-3. **四轴协议分解**（参考 `packages/llm/src/route/`）：Protocol（说什么 API） / Endpoint（URL） / Auth（鉴权） / Framing+Transport（SSE/HTTP），新厂商 = 组合 profile，协议 bug 一次修复全局生效。
+3. **模型为中心 + 每家独立引擎**（2026-09 重构）：每条模型自带接口实现/地址/Key；每家 provider 一个独立引擎文件（协议差异写死在实现内），共享底层原语（HTTP 重试/SSE/聚合）；Gateway 统一解析校验，未实现主动中文报错；新接厂商 = 新引擎文件 + 注册表/目录/联合类型各加一行。
 4. **Provider 抽象缝**：UI 与 core 解耦，保证"先跑界面交互"的迭代节奏。

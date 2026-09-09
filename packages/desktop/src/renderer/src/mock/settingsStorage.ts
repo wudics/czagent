@@ -18,7 +18,13 @@ export function loadSettings(): Settings {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        cache = JSON.parse(raw) as Settings;
+        const parsed = JSON.parse(raw) as Partial<Settings> & { providers?: unknown; models?: unknown };
+        // 旧结构（providers/models）不兼容新模型为中心的结构：模型配置重置为空
+        if (Array.isArray(parsed.providers) || Array.isArray(parsed.models)) {
+          cache = createDefaultSettings();
+          return cache;
+        }
+        cache = mergeSettings(createDefaultSettings(), parsed);
         return cache;
       }
     } catch {

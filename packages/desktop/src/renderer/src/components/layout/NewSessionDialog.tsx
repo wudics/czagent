@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import type { SessionMode, ThinkingMode } from '@czagent/core';
+import { implMetaOf, type SessionMode, type ThinkingMode } from '@czagent/core';
 import { useSessionsStore } from '../../stores/sessions';
 import { useSettingsStore } from '../../stores/settings';
 import { MOCK_THINKING_MODES } from '../../mock/scenarios';
@@ -11,13 +11,10 @@ import { Select } from '../ui/select';
 export function NewSessionDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { t } = useTranslation();
   const create = useSessionsStore((s) => s.create);
-  const allModels = useSettingsStore((s) => s.settings.models);
-  const agents = useSettingsStore((s) => s.settings.agents);
-  const chatModels = useMemo(
-    () => allModels.filter((m) => m.capability === 'chat' && m.enabled),
-    [allModels],
-  );
-  const providers = useSettingsStore((s) => s.settings.providers);
+  // selector 只选稳定引用（settings），派生数组在组件内 useMemo（避免 snapshot 不稳定引发无限重渲染）
+  const settings = useSettingsStore((s) => s.settings);
+  const chatModels = useMemo(() => settings.chatModels.filter((m) => m.enabled), [settings.chatModels]);
+  const agents = settings.agents;
   const [title, setTitle] = useState('');
   const [mode, setMode] = useState<SessionMode>('chat');
   const [agentId, setAgentId] = useState<string>('build');
@@ -37,8 +34,6 @@ export function NewSessionDialog({ open, onClose }: { open: boolean; onClose: ()
     onClose();
     setTitle('');
   };
-
-  const providerName = (id: string): string => providers.find((p) => p.id === id)?.name ?? id;
 
   return (
     <Dialog
@@ -102,7 +97,7 @@ export function NewSessionDialog({ open, onClose }: { open: boolean; onClose: ()
             <Select value={modelId} onChange={(e) => setModelId(e.target.value)}>
               {chatModels.map((m) => (
                 <option key={m.id} value={m.id}>
-                  {m.name}（{providerName(m.provider)}）
+                  {m.displayName}（{implMetaOf(m.implId)?.name ?? m.implId}）
                 </option>
               ))}
             </Select>

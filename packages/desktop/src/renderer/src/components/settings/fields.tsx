@@ -53,16 +53,3 @@ export function Section({ title, children, action }: { title: string; children: 
     </section>
   );
 }
-
-export function ProviderBadge({ kind }: { kind: string }) {
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium uppercase',
-        kind === 'builtin' ? 'bg-primary/10 text-primary' : 'bg-secondary text-secondary-foreground',
-      )}
-    >
-      {kind}
-    </span>
-  );
-}

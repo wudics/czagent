@@ -4,8 +4,6 @@
  * 本文件仅类型 + 纯函数，不依赖 Node / Electron。
  */
 
-import type { ApiStyle } from './adapters/index.js';
-
 export type SessionMode = 'chat' | 'script';
 export type ThinkingMode = 'off' | 'on' | 'deep';
 export type SessionStatus = 'idle' | 'running' | 'queued';
@@ -195,53 +193,93 @@ export type Capability =
   | 'embedding'
   | 'rerank'
   | 'image-understanding'
-  | 'video-understanding'
   | 'tts'
   | 'asr'
   | 'image-generation'
-  | 'video-generation'
-  | 'fim';
+  | 'video-generation';
 
 export const CAPABILITIES: Capability[] = [
   'chat',
   'embedding',
   'rerank',
   'image-understanding',
-  'video-understanding',
   'tts',
   'asr',
   'image-generation',
   'video-generation',
-  'fim',
 ];
 
-export interface ProviderConfig {
+/** 多模态/专用能力（非 chat；配置在 multimodalModels 区） */
+export type MultimodalCapability = Exclude<Capability, 'chat'>;
+
+export const MULTIMODAL_CAPABILITIES: MultimodalCapability[] = [
+  'embedding',
+  'rerank',
+  'image-understanding',
+  'tts',
+  'asr',
+  'image-generation',
+  'video-generation',
+];
+
+/**
+ * 对话接口实现 id（llm/engines/chat/*，与 CHAT_ENGINES 注册表一一对应）。
+ * 每家 provider（含不同 API 版本）一个独立实现；'openai-compatible' 为兼容兜底。
+ */
+export type ChatImplId = 'deepseek' | 'siliconflow' | 'agnes' | 'bigmodel' | 'qwen' | 'openrouter' | 'openai-compatible';
+
+/**
+ * 多模态接口实现 id（llm/engines/*，与 MM_ENGINES 注册表对应）。
+ * 单模型粒度各自选择实现；OpenAI 兼容系列为兜底。
+ * image-understanding 模型的请求本质是对话协议，因此可用 chat 类实现。
+ */
+export type MMImplId =
+  | ChatImplId
+  | 'agnes-video-v2.0'
+  | 'agnes-video-2.5'
+  | 'siliconflow-video'
+  | 'agnes-image'
+  | 'openai-image'
+  | 'openai-embed'
+  | 'openai-rerank'
+  | 'openai-tts'
+  | 'openai-asr';
+
+/** 对话模型（自包含：接口实现 + 地址 + Key + 模型名） */
+export interface ChatModelConfig {
   id: string;
-  name: string;
+  displayName: string;
+  /** 使用哪家的接口实现（见 ChatImplId；engines/catalog.ts 提供默认地址等元数据） */
+  implId: ChatImplId;
+  /** API 地址（添加时按实现预填默认值，可改） */
   baseUrl: string;
   /** 掩码展示；明文仅存在于持久化层 */
   apiKey: string;
-  enabled: boolean;
-  /** builtin = 内置平台（deepseek/siliconflow/agnes）；compatible = 自定义 OpenAI 兼容 */
-  kind: 'builtin' | 'compatible';
-  /** 多模态适配器风格（I15）：缺省 = 按 providerId/模型前缀隐式路由；手动指定优先于隐式 */
-  apiStyle?: ApiStyle;
-}
-
-export interface ModelConfig {
-  id: string;
-  provider: string;
-  name: string;
-  capability: Capability;
+  /** 请求体 model 参数 */
+  modelName: string;
   contextLimit: number;
   maxOutput: number;
+  enabled: boolean;
+  /** 是否支持 function-call；false 时不注入 tools */
+  toolcall: boolean;
+  /** 是否支持视觉输入；false 时图片附件降级为文件引用 */
+  vision: boolean;
+  /** 透传给接口实现的额外请求体参数 */
+  options?: Record<string, unknown>;
+}
+
+/** 多模态/专用模型（自包含，独立于对话模型区；每个模型单独选择接口实现） */
+export interface MultimodalModelConfig {
+  id: string;
+  displayName: string;
+  capability: MultimodalCapability;
+  implId: MMImplId;
+  baseUrl: string;
+  apiKey: string;
+  modelName: string;
+  /** 透传给接口实现的额外参数 */
   options?: Record<string, unknown>;
   enabled: boolean;
-  builtin?: boolean;
-  /** 是否支持 function-call（默认 true）；false 时该模型不注入 tools */
-  toolcall?: boolean;
-  /** 是否支持视觉输入（默认 true）；false 时图片附件降级为文件引用 */
-  vision?: boolean;
 }
 
 export interface CapabilityBinding {
@@ -312,8 +350,8 @@ export interface GeneralSettings {
 }
 
 export interface Settings {
-  providers: ProviderConfig[];
-  models: ModelConfig[];
+  chatModels: ChatModelConfig[];
+  multimodalModels: MultimodalModelConfig[];
   bindings: CapabilityBinding[];
   agents: AgentDef[];
   permissions: { default: PermissionRule[] };

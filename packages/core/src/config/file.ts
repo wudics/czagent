@@ -20,8 +20,13 @@ export class ConfigStore {
   async read(): Promise<Settings> {
     try {
       const raw = await fs.readFile(this.filePath(), 'utf8');
-      const parsed = JSON.parse(raw) as Settings;
-      const merged = mergeSettings(createDefaultSettings(), parsed);
+      const parsed = JSON.parse(raw) as Partial<Settings> & { providers?: unknown; models?: unknown };
+      // 旧结构（providers/models）与模型为中心的新结构不兼容：模型配置重置为空，其余（agents/permissions/general）保留
+      const legacy = Array.isArray(parsed.providers) || Array.isArray(parsed.models);
+      const base: Partial<Settings> = legacy
+        ? { ...parsed, chatModels: [], multimodalModels: [], bindings: createDefaultSettings().bindings, providers: undefined, models: undefined } as Partial<Settings>
+        : parsed;
+      const merged = mergeSettings(createDefaultSettings(), base);
       // 旧配置迁移：确保每个默认能力绑定存在（保留用户已选值）
       const bindings = [...merged.bindings];
       for (const b of DEFAULT_BINDINGS) {

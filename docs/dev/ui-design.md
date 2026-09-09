@@ -52,7 +52,7 @@
 
 - 文本输入（Enter 发送 / Shift+Enter 换行）+ 发送与**停止**按钮（运行中切换为停止）。
 - **思考模式切换**（决策 15）：下拉三档 关闭 / 思考 / 深度思考（跟随会话级设置，可临时改）。
-- **模型下拉**：当前会话 chat 模型（来自目录），可切换。
+- **模型下拉**：当前会话 chat 模型，可切换；显示值按解析回退链 `resolveChatModelId`（settings store）：会话自身 modelId（有效时）→ chat 能力绑定 → 第一个启用对话模型 → 无任何模型显示「未配置」；**不再渲染"已删除的模型"占位**（I 迭代 039）。打开会话时悬空 modelId 按回退链自动 patch 落库（chatStore.open），主循环随之直接解析成功；未配置模型时不改数据。侧栏/右栏的 `ModelName` 组件与绑定区下拉同样走该回退链。
 - **附件按钮**：打开文件选择器 → `uploadAttachment`（限制大小，见 attachments.md）。
 - 附加：发送后清空、enter 聚焦、草稿保存（切换会话保留输入）。
 
@@ -60,8 +60,7 @@
 
 | 区块 | 内容 |
 |---|---|
-| 模型 | 平台 provider 列表（deepseek/siliconflow/agnes/自定义）→ 各自 API key、baseURL → 模型实例启用/禁用、参数（temperature 等）→ 增改删（写 `model_configs`） |
-| 能力模型 | 各 capability（embedding/rerank/图像/视频/语音）默认实例绑定（决策 6） |
+| 模型 | 三区管理（2026-09 重构，I 迭代 037）：**对话模型**（每条自带接口实现 implId 下拉/baseUrl/apiKey/模型名/上下文与输出上限/toolcall/vision/参数 options，添加时预填默认地址并复用同实现 Key，保存不自动设默认）、**多模态模型**（按 capability 绑定单模型：embedding/rerank/图像/视频/语音/图像理解，实现各有针对性下拉）、**能力绑定**（8 个 capability → 模型 id，下拉按能力过滤候选，用户手动设置默认；写 config.json `chatModels`/`multimodalModels`/`bindings`） |
 | Agent | build/plan 系统提示词编辑、新建自定义 agent（提示词 + tools + permission + steps + model） |
 | 权限 | 全局默认规则、危险操作默认策略、websearch 引擎开关（P2） |
 | 通用 | 语言（中文/英文）、并发上限、压缩阈值、主题（浅/深/跟随系统） |
@@ -70,7 +69,7 @@
 
 - `sessionsStore`：会话列表 + 状态（idle/running/queued）+ 排序。
 - `chatStore(sessionId)`：已加载消息页、是否到底、自动滚动开关、输入框状态。
-- `settingsStore`：模型目录合并结果、agent 定义、权限规则。
+- `settingsStore`：模型目录合并结果、agent 定义、权限规则；派生方法 `chatModels()/modelById()/bindingOptions()/resolveChatModelId()`（返回新建数组的方法仅供命令式调用，hook 中须 selector 选 `settings` 后 useMemo 派生，防 useSyncExternalStore snapshot 不稳定）。
 - 事件分流：`onEvent` 回调按 `ev.sessionId` 分发到对应 store；运行中会话的 token/cost 实时更新页脚。
 
 ## 8. Mock 模式（决策 25，I1 核心）

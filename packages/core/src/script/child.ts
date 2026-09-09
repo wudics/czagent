@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
-import type { ChildRunOptions, ScriptAgentRunOptions } from './types.js';
+import type { ChildRunOptions, ScriptAgentRunOptions, ScriptUseOverrides } from './types.js';
 
 /** 最小 esbuild 表面（避免 core 依赖 esbuild 类型） */
 interface EsbuildLike {
@@ -86,6 +86,7 @@ var __ctx = {
   settings: __SETTINGS_JSON__,
   tools: typeof Proxy === 'undefined' ? {} : new Proxy({}, { get: function (_t, name) { if (typeof name !== 'string') return undefined; return function (input, callOpts) { var t = callOpts && typeof callOpts === 'object' ? callOpts.timeoutMs : undefined; return __call({ t: 'tool', tool: name, input: input === undefined ? null : input, timeoutMs: typeof t === 'number' && isFinite(t) && t > 0 ? Math.round(t) : null }); }; } }),
   agent: { run: function (prompt, opts) { return __call({ t: 'agent', prompt: String(prompt || ''), opts: opts || null }); } },
+  use: function (patch) { return __call({ t: 'use', patch: patch === undefined ? {} : patch }); },
   log: function () { __send({ t: 'log', line: __fmt(arguments) }); },
   ask: function (req) { return __call({ t: 'ask', tool: req && req.tool, args: (req && req.args) || {} }); },
   signal: __ctrl.signal,
@@ -296,6 +297,12 @@ export async function runEntryChild(opts: ChildRunOptions): Promise<unknown> {
           Promise.resolve()
             .then(() => opts.handlers.onAgentRun(String(f!.prompt ?? ''), aopts))
             .then((v) => replyTo(writeFrame, id, true, { value: v ?? '' }), (e) => replyTo(writeFrame, id, false, { error: String((e as Error)?.message ?? e) }));
+        } else if (t === 'use') {
+          const id = f.id;
+          const patch = (f.patch ?? {}) as ScriptUseOverrides;
+          Promise.resolve()
+            .then(() => opts.handlers.onUse(patch))
+            .then((v) => replyTo(writeFrame, id, true, { value: v ?? null }), (e) => replyTo(writeFrame, id, false, { error: String((e as Error)?.message ?? e) }));
         } else if (t === 'ask') {
           const id = f.id;
           Promise.resolve()

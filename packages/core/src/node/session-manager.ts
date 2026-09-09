@@ -7,14 +7,13 @@ import type {
   Attachment,
   AttachmentUpload,
   ChatMessage,
+  ChatModelConfig,
   CreateSessionInput,
   MessagePart,
   MessagePage,
-  ModelConfig,
   PermissionDecision,
   PermissionRequest,
   PermissionRule,
-  ProviderConfig,
   SendMessageInput,
   SessionContext,
   SessionEvent,
@@ -26,10 +25,9 @@ import type {
 } from '../provider.js';
 import type { ConfigStore } from '../config/file.js';
 import type { Db } from '../storage/client.js';
-import { streamChat } from '../llm/client.js';
-import type { ChatStreamRequest, LLMChatMessage } from '../llm/types.js';
+import { Gateway, type ResolvedChat } from '../llm/gateway.js';
+import type { ChatEngine, ChatReq, LLMChatMessage } from '../llm/types.js';
 import { LLMError, friendlyLLMMessage } from '../llm/errors.js';
-import { createGenericProfile, getBuiltinProfile } from '../llm/profile.js';
 import { createDefaultRegistry, ToolRegistry, INTERNAL_TOOLS } from '../tools/index.js';
 import type { ToolDef } from '../tools/types.js';
 import { isRichToolOutput } from '../tools/rich-output.js';
@@ -37,9 +35,9 @@ import { scanSkills, skillEnabled } from '../skills/discovery.js';
 import { effectiveToolLoaded } from '../tools/policy.js';
 import { applyTodo, todoToText, TODO_HINT, type TodoInput } from '../tools/todo.js';
 import { isMcpServerEnabled, loadMcpConfig, readMcpLayers, writeGlobalMcpConfig } from '../mcp/config.js';
-import { McpRegistry } from '../mcp/registry.js';
+import { McpRegistry, mcpServerPrefix } from '../mcp/registry.js';
 import { runEntryChild } from '../script/child.js';
-import type { ScriptAgentRunOptions } from '../script/types.js';
+import type { ScriptAgentRunOptions, ScriptUseOverrides } from '../script/types.js';
 import { checkPermission, classifyBashCommand, extractTargetPath, pathInside, resolvePath } from '../permission/index.js';
 import { patchFilePaths } from '../tools/patch.js';
 import { attachmentKind, imageToDataUrl, parseAttachmentToText, textToMessagePart } from './attachments.js';
@@ -79,12 +77,29 @@ function mcpNoteOf(tools: ToolDef[]): string {
     : '';
 }
 
+/**
+ * ctx.agent.run 的 agent 解析（I19）：id 精确 → name 精确 → 缺省/空 = build；
+ * 显式传入且两种都找不到 → 抛错（列出全部可用 agent），避免静默回退 build 造成误解。
+ */
+export function resolveAgentRef(agents: AgentDef[], ref?: string): AgentDef | undefined {
+  if (!ref || !ref.trim()) return agents.find((a) => a.id === 'build');
+  const key = ref.trim();
+  return (
+    agents.find((a) => a.id === key) ??
+    agents.find((a) => a.name === key) ??
+    (() => {
+      const list = agents.map((a) => `${a.name}(${a.id})`).join('、');
+      throw new Error(`未找到 agent：${key}（可用：${list}）`);
+    })()
+  );
+}
+
 export interface SessionManagerOptions {
   db: Db;
   config: ConfigStore;
   emit?: (ev: SessionEvent) => void;
-  /** 可注入以替换协议引擎（测试用） */
-  streamChatImpl?: typeof streamChat;
+  /** 可注入以替换对话引擎（测试用；覆盖所有 implId 的 chat 引擎） */
+  chatEngineImpl?: ChatEngine;
   /** 工具注册表（测试可注入空实现） */
   registry?: ToolRegistry;
   /** 附件 temp 根目录（会话子目录内落盘） */
@@ -101,6 +116,16 @@ function toolResultContent(r: { state: string; output?: unknown; error?: string 
     : typeof r.output === 'string'
       ? r.output
       : JSON.stringify(r.output ?? null);
+}
+
+/** 模型是否支持视觉输入（chat 模型看 vision 开关；多模态/图片理解模型视为支持） */
+function visionOk(model: ChatModelConfig | Settings['multimodalModels'][number]): boolean {
+  return !('vision' in model) || model.vision !== false;
+}
+
+/** 模型上下文窗口（0 = 未知；多模态模型无此字段） */
+function contextLimitOf(model: ChatModelConfig | Settings['multimodalModels'][number]): number {
+  return ('contextLimit' in model ? model.contextLimit : 0) ?? 0;
 }
 
 function buildRequestMessages(
@@ -196,6 +221,13 @@ export class SessionManager implements AgentProvider {
   private readonly queue: string[] = [];
   /** MCP 客户端注册表（应用级缓存：懒连接/错误隔离） */
   private readonly mcp = new McpRegistry();
+  /** LLM 网关：模型解析/校验/路由的唯一入口（无状态，按调用传入 settings） */
+  readonly gateway = new Gateway();
+
+  /** 对话引擎选择：测试注入覆盖优先，否则按模型 implId 注册表 */
+  private engineFor(target: ResolvedChat): ChatEngine {
+    return this.opts.chatEngineImpl ?? target.engine;
+  }
 
   constructor(private readonly opts: SessionManagerOptions) {
     if (opts.emit) this.listeners.add(opts.emit);
@@ -227,8 +259,10 @@ export class SessionManager implements AgentProvider {
 
   async createSession(input: CreateSessionInput): Promise<SessionMeta> {
     const settings = await this.opts.config.read();
-    const defaultChat =
-      settings.models.find((m) => m.capability === 'chat' && m.enabled)?.id ?? '';
+    // 默认模型：chat 能力绑定优先，未绑定则取第一个启用的对话模型
+    const boundChatId = settings.bindings.find((b) => b.capability === 'chat')?.modelId ?? '';
+    const boundChat = settings.chatModels.find((m) => m.id === boundChatId && m.enabled);
+    const defaultChat = boundChat?.id ?? settings.chatModels.find((m) => m.enabled)?.id ?? '';
     // 默认工作目录：用户目录\czworkspace（不存在则自动创建）
     const cwd = input.cwd && input.cwd.trim() ? input.cwd.trim() : join(homedir(), 'czworkspace');
     try {
@@ -306,16 +340,9 @@ export class SessionManager implements AgentProvider {
   private async describeImage(sessionId: string, dataUrl: string): Promise<string | null> {
     try {
       const settings = await this.opts.config.read();
-      const binding = settings.bindings.find((b) => b.capability === 'image-understanding');
-      const model = binding ? settings.models.find((m) => m.id === binding.modelId) : undefined;
-      const provider = model ? settings.providers.find((p) => p.id === model.provider) : undefined;
-      if (!model || !provider || !provider.apiKey || model.vision === false) return null;
-
-      const profile = getBuiltinProfile(provider.id) ?? createGenericProfile(provider.baseUrl);
-      const request: ChatStreamRequest = {
-        baseUrl: profile.baseUrl,
-        apiKey: provider.apiKey,
-        model: model.id,
+      const target = this.gateway.resolveChatOrNull(settings, settings.bindings.find((b) => b.capability === 'image-understanding')?.modelId ?? '');
+      if (!target || !target.vision) return null;
+      const request: ChatReq = {
         messages: [
           {
             role: 'user',
@@ -326,15 +353,8 @@ export class SessionManager implements AgentProvider {
         thinking: 'off',
         maxTokens: 1024,
         signal: this.aborts.get(sessionId)?.signal,
-        path: profile.path,
-        headers: profile.headers,
-        thinkingParams: profile.thinkingParams,
-        reasoningField: profile.reasoningField,
-        reasoningMessageField: profile.reasoningMessageField,
-        reasoningPassthrough: profile.reasoningPassthrough,
-        options: profile.options,
       };
-      const stream = this.opts.streamChatImpl ? this.opts.streamChatImpl(request) : streamChat(request);
+      const stream = this.engineFor(target).stream(target.binding, request);
       let text = '';
       for await (const ev of stream) {
         if (ev.type === 'text-delta') text += ev.text;
@@ -349,8 +369,8 @@ export class SessionManager implements AgentProvider {
   // ---- 上下文压缩 ----
 
   /** contextLimit<=0（未知）或 auto=false → 返回 null（不自动压缩）；否则返回可用 token 预算 */
-  private compactionUsable(model: ModelConfig, settings: Settings): number | null {
-    const cl = model.contextLimit ?? 0;
+  private compactionUsable(contextLimit: number, settings: Settings): number | null {
+    const cl = contextLimit ?? 0;
     const c = settings.general?.compaction;
     if (cl <= 0 || !c?.auto) return null;
     const u = cl - c.reservedTokens;
@@ -378,14 +398,13 @@ export class SessionManager implements AgentProvider {
   private async maybeCompact(opts: {
     sessionId: string;
     settings: Settings;
-    model: ModelConfig;
-    provider: ProviderConfig;
+    target: ResolvedChat;
     signal: AbortSignal;
     /** 已 prune 的请求窗口 */
     history: ChatMessage[];
     usable: number;
   }): Promise<boolean> {
-    const { sessionId, settings, model, provider, signal, history, usable } = opts;
+    const { sessionId, settings, target, signal, history, usable } = opts;
     // headIdx 跳过已有的摘要 checkpoint；其摘要文本并入新一次 summarize（避免二次压缩丢失旧摘要）
     const headIdx = this.lastCompactionIndex(history) === 0 ? 1 : 0;
     const previousSummary =
@@ -400,7 +419,7 @@ export class SessionManager implements AgentProvider {
     const tailStart = selectTailStart(history, headIdx, budget);
     const old = history.slice(headIdx, tailStart);
     if (old.length === 0) return false;
-    const summary = await this.summarize(sessionId, model, provider, old, signal, previousSummary);
+    const summary = await this.summarize(sessionId, target, old, signal, previousSummary);
     if (!summary) return false;
 
     const keep = history.slice(tailStart);
@@ -422,14 +441,12 @@ export class SessionManager implements AgentProvider {
   /** 用会话模型把旧消息总结为一段文本；图片剥为占位（不依赖视觉、不发原图），previousSummary 并入合并 */
   private async summarize(
     sessionId: string,
-    model: ModelConfig,
-    provider: ProviderConfig,
+    target: ResolvedChat,
     history: ChatMessage[],
     signal: AbortSignal,
     previousSummary?: string,
   ): Promise<string | null> {
     try {
-      const profile = getBuiltinProfile(provider.id) ?? createGenericProfile(provider.baseUrl);
       const stripped = history.map((m) => ({
         ...m,
         parts: m.parts.flatMap((p) =>
@@ -439,10 +456,7 @@ export class SessionManager implements AgentProvider {
       const system =
         '请阅读下面的对话历史，用简洁的中文写一段总结。必须保留：已得出的结论、做出的决定、重要文件/附件的名称与路径、与图片相关的内容、尚未完成的事项。不要编造历史中未出现的信息。' +
         (previousSummary ? `\n\n此前已有一份摘要如下，请合并其内容并去重：\n${previousSummary}` : '');
-      const request: ChatStreamRequest = {
-        baseUrl: profile.baseUrl,
-        apiKey: provider.apiKey,
-        model: model.id,
+      const request: ChatReq = {
         messages: [
           { role: 'system', content: system },
           ...buildRequestMessages(stripped, undefined, undefined, true),
@@ -450,15 +464,8 @@ export class SessionManager implements AgentProvider {
         thinking: 'off',
         maxTokens: 2048,
         signal,
-        path: profile.path,
-        headers: profile.headers,
-        thinkingParams: profile.thinkingParams,
-        reasoningField: profile.reasoningField,
-        reasoningMessageField: profile.reasoningMessageField,
-        reasoningPassthrough: profile.reasoningPassthrough,
-        options: profile.options,
       };
-      const stream = this.opts.streamChatImpl ? this.opts.streamChatImpl(request) : streamChat(request);
+      const stream = this.engineFor(target).stream(target.binding, request);
       let text = '';
       for await (const ev of stream) {
         if (ev.type === 'text-delta') text += ev.text;
@@ -498,7 +505,7 @@ export class SessionManager implements AgentProvider {
     // 解析附件（混合策略：文本内联 / 大文件引用 / 图片压缩→视觉或图像理解）
     if (input.attachmentIds?.length) {
       const settings = await this.opts.config.read();
-      const model = settings.models.find((m) => m.id === session.modelId);
+      const model = settings.chatModels.find((m) => m.id === session.modelId);
       const vision = model?.vision !== false;
       for (const aid of input.attachmentIds) {
         const att = this.opts.db.storage.getAttachment(aid);
@@ -619,18 +626,15 @@ export class SessionManager implements AgentProvider {
     if (!session) throw new Error('会话不存在');
     if (session.status !== 'idle') throw new Error('会话正在运行，无法压缩');
     const settings = await this.opts.config.read();
-    const model = settings.models.find((m) => m.id === session.modelId);
-    const provider = settings.providers.find((p) => p.id === model?.provider);
-    if (!model || !provider) throw new Error('找不到会话对应的模型或供应商配置');
+    const target = this.gateway.resolveChat(settings, session.modelId);
     const history = pruneHistory(this.historyWindow(sessionId).messages);
     // contextLimit 未知（<=0）或 auto 关闭时传极大预算：尾部预算钳到 15k + 条数上限 200，按此压缩
-    const usable = this.compactionUsable(model, settings) ?? Number.MAX_SAFE_INTEGER;
+    const usable = this.compactionUsable(target.contextLimit, settings) ?? Number.MAX_SAFE_INTEGER;
     const controller = new AbortController();
     const ok = await this.maybeCompact({
       sessionId,
       settings,
-      model,
-      provider,
+      target,
       signal: controller.signal,
       history,
       usable,
@@ -657,17 +661,17 @@ export class SessionManager implements AgentProvider {
     const session = this.opts.db.storage.getSession(sessionId);
     if (!session) return null;
     const settings = await this.opts.config.read();
-    const model = settings.models.find((m) => m.id === session.modelId);
+    const model = settings.chatModels.find((m) => m.id === session.modelId) ?? settings.multimodalModels.find((m) => m.id === session.modelId && m.capability === 'image-understanding');
     if (!model) return null;
     const agent = settings.agents.find((a) => a.id === session.agentId);
     const cwd = session.cwd || homedir();
     const history = pruneHistory(this.historyWindow(sessionId).messages);
     const envBlock = await this.buildEnvBlock(cwd, agent, settings);
     const mcpTools = await this.mcpToolsFor(cwd, agent, new Set<string>());
-    const requestMessages = buildRequestMessages(history, agent?.systemPrompt, envBlock + mcpNoteOf(mcpTools), model.vision !== false);
+    const requestMessages = buildRequestMessages(history, agent?.systemPrompt, envBlock + mcpNoteOf(mcpTools), visionOk(model));
     const est = estimateRequestTokens(requestMessages);
     const used = this.lastCompactionIndex(history) >= 0 ? est : Math.max(est, lastUsageTokens(history));
-    return { used, limit: model.contextLimit ?? 0 };
+    return { used, limit: contextLimitOf(model) };
   }
 
   /** 请求 env 块：平台/工作目录/日期 + 可用技能清单（runLoop 与上下文估算共用，保证口径一致） */
@@ -1015,9 +1019,21 @@ export class SessionManager implements AgentProvider {
       this.emit({ sessionId, type: 'session.updated', meta: { ...storage.getSession(sessionId)! } });
       return;
     }
-    const model = settings.models.find((m) => m.id === session.modelId);
-    const provider = settings.providers.find((p) => p.id === model?.provider);
-
+    // 启动前校验会话模型可用（Key/接口实现），不可用则给出可见错误并早退
+    try {
+      this.gateway.resolveChat(settings, session.modelId);
+    } catch (e) {
+      const scriptMsgId = nextId('a');
+      const createdAt = Date.now();
+      const parts: MessagePart[] = [];
+      storage.insertMessage({ id: scriptMsgId, sessionId, role: 'assistant', parts: [], createdAt });
+      parts.push({ type: 'error', message: String((e as Error)?.message ?? e) });
+      storage.updateMessageParts(scriptMsgId, parts);
+      this.emit({ sessionId, type: 'message.part.delta', messageId: scriptMsgId, partIndex: 0, part: parts[0]! });
+      await this.finalizeMessage(sessionId, scriptMsgId, parts, createdAt, undefined);
+      this.aborts.delete(sessionId);
+      return;
+    }
     const scriptMsgId = nextId('a');
     const createdAt = Date.now();
     const parts: MessagePart[] = [];
@@ -1038,13 +1054,6 @@ export class SessionManager implements AgentProvider {
       await this.finalizeMessage(sessionId, scriptMsgId, parts, createdAt, undefined);
     };
 
-    if (!model || !provider || !provider.apiKey) {
-      append({ type: 'error', message: '未找到该会话对应的模型/Provider 配置，或尚未填写 API Key。' });
-      this.aborts.delete(sessionId);
-      await finalize();
-      return;
-    }
-
     const registry = this.opts.registry ?? createDefaultRegistry();
     const agent = settings.agents.find((a) => a.id === session.agentId);
     const cwd = session.cwd || homedir();
@@ -1060,10 +1069,17 @@ export class SessionManager implements AgentProvider {
         else update(logIdx, part);
       };
 
-      // MCP 工具定义（按 agent 生效名单；bridge 侧 toolId → def 覆盖，其余走 registry）
+      // MCP 工具定义：按 agent 生效名单预载；ctx.use 覆盖后按需懒加载（bridge 侧 toolId → def 覆盖，其余走 registry）
       const scriptMcpAllowed = this.allowedMcpServers(cwd, agent);
-      const mcpScriptTools = scriptMcpAllowed.length > 0 ? await this.mcp.getTools(cwd, this.opts.globalMcpDir, scriptMcpAllowed) : [];
-      const mcpDefById = new Map(mcpScriptTools.map((t) => [t.id, t]));
+      const mcpDefById = new Map<string, ToolDef>();
+      const loadMcpDefs = async (servers: string[]): Promise<void> => {
+        if (servers.length === 0) return;
+        for (const t of await this.mcp.getTools(cwd, this.opts.globalMcpDir, servers)) mcpDefById.set(t.id, t);
+      };
+      await loadMcpDefs(scriptMcpAllowed);
+      // ctx.use 覆盖（I19）：null = 未设置；数组 = 权威名单（空数组全关）
+      let useMcpServers: string[] | null = null;
+      let useSkills: string[] | null = null;
 
       const timeoutMinutes = settings.general.scriptTimeoutMinutes ?? 0;
       // I14.1：node 子进程运行入口脚本；ctx 全经 stdio 桥回主进程（权限/卡片/子代理/日志）
@@ -1084,11 +1100,35 @@ export class SessionManager implements AgentProvider {
             if (webAccessDisabled(session).has(toolId)) {
               throw new Error(`本会话已关闭联网，无法调用 ${toolId}`);
             }
+            // ctx.use MCP 门控（I19）：覆盖生效时按脚本名单归属；名单内但定义未载 → 懒加载
+            if (toolId.startsWith('mcp_') && useMcpServers !== null) {
+              const server = useMcpServers.find((n) => toolId.startsWith(mcpServerPrefix(n)));
+              if (!server) throw new Error(`MCP 服务器未在 ctx.use 名单中，无法调用 ${toolId}`);
+              if (!mcpDefById.has(toolId)) await loadMcpDefs([server]);
+            }
             const def = mcpDefById.get(toolId);
-            return this.runScriptTool({ registry, toolId, ...(def ? { def } : {}), input, sessionId, cwd, settings, agent, signal, append, update, ...(timeoutMs ? { timeoutMs } : {}) });
+            return this.runScriptTool({
+              registry,
+              toolId,
+              ...(def ? { def } : {}),
+              input,
+              sessionId,
+              cwd,
+              settings,
+              agent,
+              signal,
+              append,
+              update,
+              ...(timeoutMs ? { timeoutMs } : {}),
+              ...(useSkills !== null ? { allowedSkills: useSkills } : {}),
+            });
           },
           onAgentRun: (prompt, agentOpts) =>
             this.runSubAgent({ sessionId, session, settings, registry, cwd, envBlock, signal, prompt, agentOpts, disabledTools: webAccessDisabled(session), append, update }),
+          onUse: (patch: ScriptUseOverrides) => {
+            if ('mcpServers' in patch) useMcpServers = Array.isArray(patch.mcpServers) ? patch.mcpServers.map(String) : null;
+            if ('skills' in patch) useSkills = Array.isArray(patch.skills) ? patch.skills.map(String) : null;
+          },
           onLog: (line) => scriptLog(line),
           onAsk: (tool, args) => this.requestPermission(sessionId, cwd, tool, (args ?? {}) as Record<string, unknown>, signal),
         },
@@ -1122,13 +1162,15 @@ export class SessionManager implements AgentProvider {
     cwd: string;
     settings: Settings;
     agent?: AgentDef;
+    /** ctx.use 技能白名单覆盖（I19）：透传给 skill 工具的 allowedSkills */
+    allowedSkills?: string[];
     signal: AbortSignal;
     /** 单次调用超时毫秒（缺省/0 = 不限） */
     timeoutMs?: number;
     append: (part: MessagePart) => number;
     update: (idx: number, part: MessagePart) => void;
   }): Promise<unknown> {
-    const { registry, toolId, input, sessionId, cwd, settings, agent, signal, timeoutMs, append, update, def: defOverride } = opts;
+    const { registry, toolId, input, sessionId, cwd, settings, agent, signal, timeoutMs, append, update, allowedSkills, def: defOverride } = opts;
     const def = defOverride ?? registry.get(toolId);
     if (!def || INTERNAL_TOOLS.includes(toolId)) throw new Error(`未知或不可用的工具：${toolId}`);
 
@@ -1158,9 +1200,11 @@ export class SessionManager implements AgentProvider {
         sessionId,
         cwd,
         settings,
+        gateway: this.gateway,
         signal: callCtrl.signal,
         tempDir: this.opts.attachmentsDir,
         builtinSkillsDir: this.opts.builtinSkillsDir,
+        ...(allowedSkills ? { allowedSkills } : {}),
         reportProgress: (text) => {
           update(callIdx, { type: 'tool-call', tool: toolId, callID, input, state: 'running', title: text });
         },
@@ -1214,16 +1258,26 @@ export class SessionManager implements AgentProvider {
     update: (idx: number, part: MessagePart) => void;
   }): Promise<string> {
     const { sessionId, session, settings, registry, cwd, envBlock, signal, prompt, agentOpts, disabledTools, append, update } = opts;
-    const agentDef =
-      settings.agents.find((a) => a.id === (agentOpts?.agent ?? 'build')) ??
-      settings.agents.find((a) => a.id === 'build');
+    // agent 解析（I19）：id 精确 → name 精确 → 显式传入找不到抛错；缺省/空 = build
+    const agentDef = resolveAgentRef(settings.agents, agentOpts?.agent);
     // 工具绑定：agentOpts.tools 显式白名单；否则按 agent 矩阵 load 链；plan/plan-exit 子运行永远排除
     const rules = settings.permissions.default;
     // 子代理禁止再派生/问询：task 防嵌套、question 保持主会话专用
     const SUB_AGENT_HIDDEN = ['task', 'question'];
-    // MCP 工具定义：默认按 agent 生效服务器名单；agentOpts.mcpServers 显式传入时取交集
-    const mcpAllowedBase = this.allowedMcpServers(cwd, agentDef);
-    const mcpAllowed = agentOpts?.mcpServers ? mcpAllowedBase.filter((n) => agentOpts.mcpServers!.includes(n)) : mcpAllowedBase;
+    // MCP 服务器名单（I19 权威覆盖）：显式传入即按脚本名单（仅限 mcp.json 已配置服务器，未知名忽略）；
+    // 缺省 = 按 agent 的三态设置（跟随全局/强制开/排除）计算生效名单
+    let mcpAllowed: string[];
+    if (agentOpts?.mcpServers) {
+      let configured: string[] = [];
+      try {
+        configured = Object.keys(loadMcpConfig(cwd, this.opts.globalMcpDir));
+      } catch {
+        configured = [];
+      }
+      mcpAllowed = agentOpts.mcpServers.filter((n) => configured.includes(n));
+    } else {
+      mcpAllowed = this.allowedMcpServers(cwd, agentDef);
+    }
     const mcpTools =
       mcpAllowed.length > 0
         ? (await this.mcp.getTools(cwd, this.opts.globalMcpDir, mcpAllowed)).filter((t) => !(disabledTools?.has(t.id) ?? false))
@@ -1245,12 +1299,9 @@ export class SessionManager implements AgentProvider {
     } else if (!agentOpts?.tools && this.isAgentAllOpen(agentDef)) {
       resolved = resolved.concat(mcpCandidates);
     }
-    const model =
-      (agentOpts?.model ? settings.models.find((m) => m.id === agentOpts.model) : undefined) ??
-      settings.models.find((m) => m.id === session.modelId);
-    const provider = settings.providers.find((p) => p.id === model?.provider);
-    if (!model || !provider?.apiKey) throw new Error('子运行模型不可用或未配置 API Key');
-    const profile = getBuiltinProfile(provider.id) ?? createGenericProfile(provider.baseUrl);
+    const target =
+      this.gateway.resolveChatOrNull(settings, agentOpts?.model ?? '') ??
+      this.gateway.resolveChat(settings, session.modelId);
     // 步数：agentOpts.maxSteps 显式覆盖 > agent 定义 steps > 不限（与设置界面"留空=不限"一致）
     const maxSteps =
       agentOpts?.maxSteps && agentOpts.maxSteps > 0
@@ -1258,7 +1309,7 @@ export class SessionManager implements AgentProvider {
         : agentDef?.steps && agentDef.steps > 0
           ? agentDef.steps
           : Number.POSITIVE_INFINITY;
-    const canTool = model.toolcall !== false;
+    const canTool = target.toolcall;
 
     const promptMsg: ChatMessage = {
       id: 'sub-prompt',
@@ -1267,7 +1318,7 @@ export class SessionManager implements AgentProvider {
       parts: [{ type: 'text', text: prompt }],
       createdAt: 0,
     };
-    const messages = buildRequestMessages([promptMsg], agentDef?.systemPrompt, envBlock, model.vision !== false);
+    const messages = buildRequestMessages([promptMsg], agentDef?.systemPrompt, envBlock, target.vision);
 
     let finalText = '';
     let streamAcc = '';
@@ -1279,21 +1330,12 @@ export class SessionManager implements AgentProvider {
         exhausted = false;
         return finalText;
       }
-      const request: ChatStreamRequest = {
-        baseUrl: profile.baseUrl,
-        apiKey: provider.apiKey,
-        model: model.id,
+      const request: ChatReq = {
         messages,
         thinking: session.thinkingMode,
-        maxTokens: model.maxOutput > 0 ? model.maxOutput : undefined,
+        maxTokens: target.maxOutput > 0 ? target.maxOutput : undefined,
         signal,
-        path: profile.path,
-        headers: profile.headers,
-        thinkingParams: profile.thinkingParams,
-        reasoningField: profile.reasoningField,
-        reasoningMessageField: profile.reasoningMessageField,
-        reasoningPassthrough: profile.reasoningPassthrough,
-        options: profile.options,
+        options: target.options,
         tools: canTool && resolved.length > 0 ? registry.toOpenAI(resolved) : undefined,
       };
 
@@ -1301,7 +1343,7 @@ export class SessionManager implements AgentProvider {
       const turnToolCalls: { callID: string; tool: string; input: unknown }[] = [];
       let turnFinish = '';
       let streamError: LLMError | undefined;
-      const stream = this.opts.streamChatImpl ? this.opts.streamChatImpl(request) : streamChat(request);
+      const stream = this.engineFor(target).stream(target.binding, request);
       try {
         for await (const ev of stream) {
           if (ev.type === 'text-delta') {
@@ -1313,7 +1355,7 @@ export class SessionManager implements AgentProvider {
             turnToolCalls.push({ callID: ev.callID, tool: ev.tool, input: ev.input });
           } else if (ev.type === 'finish') {
             turnFinish = ev.finishReason;
-            if (ev.usage) this.reportUsage(sessionId, model.id, ev.usage);
+            if (ev.usage) this.reportUsage(sessionId, target.modelId, ev.usage);
           } else if (ev.type === 'error') {
             streamError = ev.error;
           }
@@ -1362,9 +1404,11 @@ export class SessionManager implements AgentProvider {
                   sessionId,
                   cwd,
                   settings,
+                  gateway: this.gateway,
                   signal,
                   tempDir: this.opts.attachmentsDir,
                   builtinSkillsDir: this.opts.builtinSkillsDir,
+                  ...(agentOpts?.skills ? { allowedSkills: agentOpts.skills } : {}),
                   reportProgress: (text) => {
                     update(callIdx, { type: 'tool-call', tool: tc.tool, callID: tc.callID, input: tc.input, state: 'running', title: text });
                   },
@@ -1472,22 +1516,17 @@ export class SessionManager implements AgentProvider {
       this.emit({ sessionId, type: 'session.updated', meta: { ...storage.getSession(sessionId)! } });
       return;
     }
-    const model = settings.models.find((m) => m.id === session.modelId);
-    const provider = settings.providers.find((p) => p.id === model?.provider);
+    // 基准目标：会话启动时的模型（运行中切换模型后，每轮循环会重新解析，失败则回退到本目标）
+    let baseTarget: ResolvedChat;
+    try {
+      baseTarget = this.gateway.resolveChat(settings, session.modelId);
+    } catch (e) {
+      const id = nextId('a');
+      await appendError(id, [], Date.now(), String((e as Error)?.message ?? e));
+      this.aborts.delete(sessionId);
+      return;
+    }
     const agent = settings.agents.find((a) => a.id === session.agentId);
-
-    if (!model || !provider) {
-      const id = nextId('a');
-      await appendError(id, [], Date.now(), '未找到该会话对应的模型/Provider 配置。');
-      this.aborts.delete(sessionId);
-      return;
-    }
-    if (!provider.apiKey) {
-      const id = nextId('a');
-      await appendError(id, [], Date.now(), '尚未配置 API Key，请到「设置 → 模型」填写后再试。');
-      this.aborts.delete(sessionId);
-      return;
-    }
 
     const registry = this.opts.registry ?? createDefaultRegistry();
     const disabled = new Set<string>();
@@ -1524,44 +1563,43 @@ export class SessionManager implements AgentProvider {
         const baseTools = registry
           .list()
           .filter((t) => !turnDisabled.has(t.id) && !disabled.has(t.id) && effectiveToolLoaded(turnAgent, settings.permissions.default, t.id));
-        const turnModel = settings.models.find((m) => m.id === current?.modelId) ?? model;
-        const turnProvider = settings.providers.find((p) => p.id === turnModel.provider) ?? provider;
-        const turnProfile = getBuiltinProfile(turnProvider.id) ?? createGenericProfile(turnProvider.baseUrl);
+        // 每轮重新解析模型（支持运行中切换模型：下一轮立即生效；解析失败回退到基准目标）
+        const turnTarget = this.gateway.resolveChatOrNull(settings, current?.modelId ?? '') ?? baseTarget;
+        
         const turnThinking = current?.thinkingMode ?? session.thinkingMode;
         // MCP 工具并入：按 agent 生效服务器名单（全开=全局 enabled 且非 off；受限=点名 on）
         const mcpTools = await this.mcpToolsFor(cwd, turnAgent, disabled);
         const tools = baseTools.concat(mcpTools);
         const mcpNote = mcpNoteOf(mcpTools);
-        const canTool = turnModel.toolcall !== false;
+        const canTool = turnTarget.toolcall;
         // 上下文压缩：溢出检测（估算 ∨ 上次真实 usage）→ 摘要 checkpoint → 仍超限丢最旧重试 ≤1；
         // contextLimit<=0 / auto=false 时跳过；工具输出持续 prune（请求侧，DB 不动）
-        const compactUsable = this.compactionUsable(turnModel, settings);
+        const compactUsable = this.compactionUsable(turnTarget.contextLimit, settings);
         const window0 = this.historyWindow(sessionId);
         let history = pruneHistory(window0.messages);
         // 窗口饱和（>300 条且窗口内无可见 checkpoint）→ 即使 token 未超预算也强制压缩，避免历史被静默丢弃
         const saturationCompact = window0.saturated && settings.general.compaction.auto;
-        let requestMessages = buildRequestMessages(history, turnAgent?.systemPrompt, envBlock + mcpNote, turnModel.vision !== false);
+        let requestMessages = buildRequestMessages(history, turnAgent?.systemPrompt, envBlock + mcpNote, turnTarget.vision);
         let est = Math.max(estimateRequestTokens(requestMessages), lastUsageTokens(history));
         if ((compactUsable !== null && est >= compactUsable) || saturationCompact) {
           // 饱和触发的压缩不依赖 token 预算：usable 传极大值（尾部预算钳到 15k + 条数上限 200）
           await this.maybeCompact({
             sessionId,
             settings,
-            model: turnModel,
-            provider: turnProvider,
+            target: turnTarget,
             signal,
             history,
             usable: compactUsable ?? Number.MAX_SAFE_INTEGER,
           });
           history = pruneHistory(this.historyWindow(sessionId).messages);
-          requestMessages = buildRequestMessages(history, turnAgent?.systemPrompt, envBlock + mcpNote, turnModel.vision !== false);
+          requestMessages = buildRequestMessages(history, turnAgent?.systemPrompt, envBlock + mcpNote, turnTarget.vision);
           est = Math.max(estimateRequestTokens(requestMessages), lastUsageTokens(history));
           if (compactUsable !== null && est >= compactUsable) {
             const start = this.lastCompactionIndex(history) === 0 ? 1 : 0;
             if (start < history.length) {
               // 丢弃最旧一条非 checkpoint 消息（保留摘要 checkpoint），仅重试一次
               history = pruneHistory(history.slice(0, start).concat(history.slice(start + 1)));
-              requestMessages = buildRequestMessages(history, turnAgent?.systemPrompt, envBlock + mcpNote, turnModel.vision !== false);
+              requestMessages = buildRequestMessages(history, turnAgent?.systemPrompt, envBlock + mcpNote, turnTarget.vision);
             }
           }
         }
@@ -1569,22 +1607,13 @@ export class SessionManager implements AgentProvider {
         // 窗口含 checkpoint 时上次真实 usage 口径失效（测量自压缩前更大的窗口），改用纯估算。
         // 溢出检测用的 est 保持 max 混合口径，不受影响
         const gaugeUsed = this.lastCompactionIndex(history) >= 0 ? estimateRequestTokens(requestMessages) : est;
-        this.emit({ sessionId, type: 'session.context', used: gaugeUsed, limit: turnModel.contextLimit ?? 0 });
-        const request: ChatStreamRequest = {
-          baseUrl: turnProfile.baseUrl,
-          apiKey: turnProvider.apiKey,
-          model: turnModel.id,
+        this.emit({ sessionId, type: 'session.context', used: gaugeUsed, limit: turnTarget.contextLimit });
+        const request: ChatReq = {
           messages: requestMessages,
           thinking: turnThinking,
-          maxTokens: turnModel.maxOutput > 0 ? turnModel.maxOutput : undefined,
+          maxTokens: turnTarget.maxOutput > 0 ? turnTarget.maxOutput : undefined,
           signal,
-          path: turnProfile.path,
-          headers: turnProfile.headers,
-          thinkingParams: turnProfile.thinkingParams,
-          reasoningField: turnProfile.reasoningField,
-          reasoningMessageField: turnProfile.reasoningMessageField,
-          reasoningPassthrough: turnProfile.reasoningPassthrough,
-          options: turnProfile.options,
+          options: turnTarget.options,
           tools: canTool && tools.length > 0 ? registry.toOpenAI(tools) : undefined,
         };
 
@@ -1601,7 +1630,7 @@ export class SessionManager implements AgentProvider {
         let turnFinish: string | undefined;
         let streamError: LLMError | undefined;
 
-        const stream = this.opts.streamChatImpl ? this.opts.streamChatImpl(request) : streamChat(request);
+        const stream = this.engineFor(turnTarget).stream(turnTarget.binding, request);
         try {
           for await (const ev of stream) {
             switch (ev.type) {
@@ -1633,7 +1662,7 @@ export class SessionManager implements AgentProvider {
                 if (ev.usage) {
                   providerUsage = ev.usage;
                   // 逐轮落库+广播：Token 统计随每次 LLM 请求实时刷新，不再等整轮结束
-                  this.reportUsage(sessionId, turnModel.id, ev.usage);
+                  this.reportUsage(sessionId, turnTarget.modelId, ev.usage);
                 }
                 break;
               case 'error':
@@ -1711,6 +1740,7 @@ export class SessionManager implements AgentProvider {
                   sessionId,
                   cwd,
                   settings,
+                  gateway: this.gateway,
                   signal,
                   tempDir: this.opts.attachmentsDir,
                   builtinSkillsDir: this.opts.builtinSkillsDir,
@@ -1855,7 +1885,7 @@ export class SessionManager implements AgentProvider {
     }
   }
 
-  /** 用会话模型生成标题（单次对话，走 streamChatImpl 便于测试注入） */
+  /** 用会话模型生成标题（单次对话，走 chatEngineImpl 便于测试注入） */
   private async generateTitle(
     sessionId: string,
     session: SessionMeta,
@@ -1864,14 +1894,9 @@ export class SessionManager implements AgentProvider {
     assistantText: string,
   ): Promise<string | null> {
     try {
-      const model = settings.models.find((m) => m.id === session.modelId);
-      const provider = settings.providers.find((p) => p.id === model?.provider);
-      if (!model || !provider?.apiKey) return null;
-      const profile = getBuiltinProfile(provider.id) ?? createGenericProfile(provider.baseUrl);
-      const request: ChatStreamRequest = {
-        baseUrl: profile.baseUrl,
-        apiKey: provider.apiKey,
-        model: model.id,
+      const target = this.gateway.resolveChatOrNull(settings, session.modelId);
+      if (!target) return null;
+      const request: ChatReq = {
         messages: [
           {
             role: 'system',
@@ -1881,15 +1906,8 @@ export class SessionManager implements AgentProvider {
         ],
         thinking: 'off',
         maxTokens: 64,
-        path: profile.path,
-        headers: profile.headers,
-        thinkingParams: profile.thinkingParams,
-        reasoningField: profile.reasoningField,
-        reasoningMessageField: profile.reasoningMessageField,
-        reasoningPassthrough: profile.reasoningPassthrough,
-        options: profile.options,
       };
-      const stream = this.opts.streamChatImpl ? this.opts.streamChatImpl(request) : streamChat(request);
+      const stream = this.engineFor(target).stream(target.binding, request);
       let text = '';
       for await (const ev of stream) {
         if (ev.type === 'text-delta') text += ev.text;
@@ -1955,8 +1973,8 @@ export class SessionManager implements AgentProvider {
     // 上下文仪表：轻量口径（API input 已含 system prompt/工具定义，usageTotal 即本次请求规模）
     try {
       const cfg = await this.opts.config.read();
-      const fm = cfg.models.find((m) => m.id === session?.modelId);
-      this.emit({ sessionId, type: 'session.context', used: usageTotal(usage), limit: fm?.contextLimit ?? 0 });
+      const fm = cfg.chatModels.find((m) => m.id === session?.modelId) ?? cfg.multimodalModels.find((m) => m.id === session?.modelId);
+      this.emit({ sessionId, type: 'session.context', used: usageTotal(usage), limit: fm ? contextLimitOf(fm) : 0 });
     } catch {
       // 上下文推送失败不影响落库
     }

@@ -1,40 +1,14 @@
-import type { AgentDef, CapabilityBinding, ModelConfig, PermissionRule, ProviderConfig, Settings } from './provider.js';
-
-export const DEFAULT_PROVIDERS: ProviderConfig[] = [
-  { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com', apiKey: '', enabled: true, kind: 'builtin' },
-  { id: 'siliconflow', name: 'SiliconFlow', baseUrl: 'https://api.siliconflow.cn/v1', apiKey: '', enabled: true, kind: 'builtin' },
-  { id: 'agnes', name: 'Agnes', baseUrl: 'https://apihub.agnes-ai.com/v1', apiKey: '', enabled: true, kind: 'builtin' },
-];
-
-export const DEFAULT_MODELS: ModelConfig[] = [
-  { id: 'deepseek-v4-pro', provider: 'deepseek', name: 'DeepSeek V4 Pro', capability: 'chat', contextLimit: 1_000_000, maxOutput: 393_216, enabled: true, builtin: true },
-  { id: 'deepseek-v4-flash', provider: 'deepseek', name: 'DeepSeek V4 Flash', capability: 'chat', contextLimit: 1_000_000, maxOutput: 393_216, enabled: true, builtin: true },
-  { id: 'deepseek-ai/DeepSeek-V4-Flash', provider: 'siliconflow', name: 'deepseek-ai/DeepSeek-V4-Flash', capability: 'chat', contextLimit: 1_000_000, maxOutput: 32_768, enabled: true, builtin: true, vision: false },
-  { id: 'Qwen/Qwen3-32B', provider: 'siliconflow', name: 'Qwen/Qwen3-32B', capability: 'chat', contextLimit: 128_000, maxOutput: 32_768, enabled: true, builtin: true },
-  { id: 'agnes-2.5-flash', provider: 'agnes', name: 'Agnes 2.5 Flash', capability: 'chat', contextLimit: 524_288, maxOutput: 65_536, enabled: true, builtin: true },
-  { id: 'agnes-2.5-pro', provider: 'agnes', name: 'Agnes 2.5 Pro', capability: 'chat', contextLimit: 1_000_000, maxOutput: 65_536, enabled: true, builtin: true },
-  { id: 'BAAI/bge-m3', provider: 'siliconflow', name: 'BAAI/bge-m3', capability: 'embedding', contextLimit: 8192, maxOutput: 1024, enabled: true, builtin: true, toolcall: false, vision: false },
-  { id: 'BAAI/bge-reranker-v2-m3', provider: 'siliconflow', name: 'BAAI/bge-reranker-v2-m3', capability: 'rerank', contextLimit: 8192, maxOutput: 1024, enabled: true, builtin: true, toolcall: false, vision: false },
-  { id: 'agnes-image-2.1-flash', provider: 'agnes', name: 'Agnes Image 2.1 Flash', capability: 'image-generation', contextLimit: 0, maxOutput: 0, enabled: true, builtin: true, toolcall: false, vision: false },
-  { id: 'agnes-image-2.5-flash', provider: 'agnes', name: 'agnes-image-2.5-flash', capability: 'image-generation', contextLimit: 0, maxOutput: 0, enabled: true, builtin: true, toolcall: false, vision: false },
-  { id: 'Kwai-Kolors/Kolors', provider: 'siliconflow', name: 'Kwai-Kolors/Kolors', capability: 'image-generation', contextLimit: 0, maxOutput: 0, enabled: true, builtin: true, toolcall: false, vision: false },
-  { id: 'agnes-video-v2.0', provider: 'agnes', name: 'agnes-video-v2.0', capability: 'video-generation', contextLimit: 0, maxOutput: 0, enabled: true, builtin: true, toolcall: false, vision: false },
-  { id: 'agnes-video-2.5-flash', provider: 'agnes', name: 'agnes-video-2.5-flash', capability: 'video-generation', contextLimit: 0, maxOutput: 0, enabled: true, builtin: true, toolcall: false, vision: false },
-  { id: 'Wan-AI/Wan2.2-I2V-A14B', provider: 'siliconflow', name: 'Wan-AI/Wan2.2-I2V-A14B', capability: 'video-generation', contextLimit: 0, maxOutput: 0, enabled: true, builtin: true, toolcall: false, vision: false },
-  { id: 'Wan-AI/Wan2.2-T2V-A14B', provider: 'siliconflow', name: 'Wan-AI/Wan2.2-T2V-A14B', capability: 'video-generation', contextLimit: 0, maxOutput: 0, enabled: true, builtin: true, toolcall: false, vision: false },
-  { id: 'fnlp/MOSS-TTSD-v0.5', provider: 'siliconflow', name: 'fnlp/MOSS-TTSD-v0.5', capability: 'tts', contextLimit: 0, maxOutput: 0, enabled: true, builtin: true, toolcall: false, vision: false },
-  { id: 'FunAudioLLM/SenseVoiceSmall', provider: 'siliconflow', name: 'FunAudioLLM/SenseVoiceSmall', capability: 'asr', contextLimit: 0, maxOutput: 0, enabled: true, builtin: true, toolcall: false, vision: false },
-];
+import type { AgentDef, CapabilityBinding, PermissionRule, Settings } from './provider.js';
 
 export const DEFAULT_BINDINGS: CapabilityBinding[] = [
-  { capability: 'chat', modelId: 'deepseek-v4-pro' },
-  { capability: 'image-understanding', modelId: 'agnes-2.5-flash' },
-  { capability: 'embedding', modelId: 'BAAI/bge-m3' },
-  { capability: 'rerank', modelId: 'BAAI/bge-reranker-v2-m3' },
-  { capability: 'image-generation', modelId: 'agnes-image-2.1-flash' },
-  { capability: 'video-generation', modelId: 'agnes-video-2.5-flash' },
-  { capability: 'tts', modelId: 'fnlp/MOSS-TTSD-v0.5' },
-  { capability: 'asr', modelId: 'FunAudioLLM/SenseVoiceSmall' },
+  { capability: 'chat', modelId: '' },
+  { capability: 'image-understanding', modelId: '' },
+  { capability: 'embedding', modelId: '' },
+  { capability: 'rerank', modelId: '' },
+  { capability: 'image-generation', modelId: '' },
+  { capability: 'video-generation', modelId: '' },
+  { capability: 'tts', modelId: '' },
+  { capability: 'asr', modelId: '' },
 ];
 
 const BUILD_AGENT: AgentDef = {
@@ -82,8 +56,8 @@ export const DEFAULT_GENERAL = {
 
 export function createDefaultSettings(): Settings {
   return {
-    providers: DEFAULT_PROVIDERS.map((p) => ({ ...p })),
-    models: DEFAULT_MODELS.map((m) => ({ ...m, options: m.options ? { ...m.options } : undefined })),
+    chatModels: [],
+    multimodalModels: [],
     bindings: DEFAULT_BINDINGS.map((b) => ({ ...b })),
     agents: DEFAULT_AGENTS.map((a) => ({ ...a, permission: { ...a.permission }, tools: [...a.tools] })),
     permissions: { default: DEFAULT_PERMISSIONS.default.map((r) => ({ ...r })) },

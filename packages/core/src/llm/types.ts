@@ -23,22 +23,29 @@ export type LLMEvent =
   | { type: 'finish'; finishReason: string; usage?: Usage }
   | { type: 'error'; error: LLMError };
 
-export interface ChatStreamRequest {
+/** 对话引擎的连接信息（来自模型配置，网关解析后传入） */
+export interface ChatBinding {
   baseUrl: string;
   apiKey: string;
-  model: string;
+  modelName: string;
+}
+
+/** 对话请求（纯业务字段；协议差异由各家引擎自行处理） */
+export interface ChatReq {
   messages: LLMChatMessage[];
   thinking: ThinkingMode;
   maxTokens?: number;
   signal?: AbortSignal;
-  /** 平台差异（见 profile.ts） */
-  path?: string;
-  headers?: Record<string, string>;
-  thinkingParams?: (mode: ThinkingMode) => Record<string, unknown> | undefined;
-  reasoningField?: string;
-  reasoningMessageField?: string;
-  reasoningPassthrough?: boolean;
   /** OpenAI 格式的 tools 数组（已含 type/function/parameters） */
   tools?: Record<string, unknown>[];
+  /** 额外请求体参数（模型 options 透传） */
   options?: Record<string, unknown>;
+}
+
+/**
+ * 对话引擎接口：每家 provider（含不同 API 版本）一个独立实现（llm/engines/chat/*），
+ * 请求组装、思考参数、reasoning 字段等协议差异全部写死在各自文件内。
+ */
+export interface ChatEngine {
+  stream(b: ChatBinding, req: ChatReq): AsyncGenerator<LLMEvent>;
 }

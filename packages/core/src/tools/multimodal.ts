@@ -1,56 +1,14 @@
-/** 多模态能力工具（I10，I15 适配层 / I17 profile 化）：embed / rerank / 图像（文生图/图生图）/ 视频（文/图生）/ tts / asr。
- *  模型来自能力绑定（settings.bindings）；API 差异全部下沉 adapters/profiles（按能力 profile 化），
- *  本文件只做：绑定解析→resolveCapability 解析执行器→参数校验→调用→落盘/富输出/进度。 */
+/** 多模态能力工具（embed / rerank / 图像（文生图/图生图）/ 视频（文/图生）/ tts / asr）。
+ *  模型来自能力绑定（settings.bindings）；解析/校验/路由全部收敛到 gateway（按模型 implId 显式路由引擎），
+ *  本文件只做：参数校验 → gateway 调用 → 落盘/富输出/进度。 */
 import { promises as fs } from 'node:fs';
 import { basename, join } from 'node:path';
-import type { Capability, Settings } from '../provider.js';
 import type { ToolDef, ToolContext } from './types.js';
+import type { GatewayCtx } from '../llm/gateway.js';
 import { richOutput } from './rich-output.js';
-import { resolveCapability, type AdapterPick, type MMCtx, type VideoTaskResult } from '../adapters/index.js';
-import { toDataUrl } from '../adapters/shared.js';
+import { toDataUrl } from '../llm/engines/mm.js';
 
-interface ResolvedBinding {
-  baseUrl: string;
-  apiKey: string;
-  model: string;
-  providerId: string;
-  apiStyle?: 'openai' | 'agnes';
-}
-
-const CAP_LABEL: Record<string, string> = {
-  embedding: '向量化（embedding）',
-  rerank: '重排序（rerank）',
-  'image-generation': '图像生成',
-  'video-generation': '视频生成',
-  tts: '语音合成（TTS）',
-  asr: '语音识别（ASR）',
-};
-
-/** 能力绑定解析：capability → 绑定模型 → provider（baseUrl/apiKey/apiStyle）；无绑定/无 key 报错 */
-function resolveBinding(settings: Settings, capability: Capability): ResolvedBinding {
-  const modelId = settings.bindings.find((b) => b.capability === capability)?.modelId;
-  const model = settings.models.find((m) => m.id === modelId && m.enabled);
-  const provider = settings.providers.find((p) => p.id === model?.provider);
-  if (!model || !provider) {
-    throw new Error(`未配置${CAP_LABEL[capability]! ?? capability}模型，请到「设置 → 模型」中绑定后再试`);
-  }
-  if (!provider.apiKey) {
-    throw new Error(`${CAP_LABEL[capability]! ?? capability}所属 Provider「${provider.name}」尚未配置 API Key`);
-  }
-  return {
-    baseUrl: provider.baseUrl.replace(/\/+$/, ''),
-    apiKey: provider.apiKey,
-    model: model.id,
-    providerId: provider.id,
-    apiStyle: provider.apiStyle,
-  };
-}
-
-function pickOf(b: ResolvedBinding): AdapterPick {
-  return { providerId: b.providerId, model: b.model, ...(b.apiStyle ? { apiStyle: b.apiStyle } : {}) };
-}
-
-function mmCtx(ctx: ToolContext): MMCtx {
+function gctx(ctx: ToolContext): GatewayCtx {
   return { signal: ctx.signal, report: (msg) => ctx.reportProgress?.(msg) };
 }
 
@@ -71,40 +29,38 @@ function startTicker(ctx: ToolContext, label: string): () => void {
   return () => clearInterval(ticker);
 }
 
-// ---------- 各能力实现（薄壳：参数校验 + 适配器调用 + 结果后处理） ----------
+// ---------- 各能力实现（薄壳：参数校验 + gateway 调用 + 结果后处理） ----------
 
 async function doEmbed(input: Record<string, unknown>, ctx: ToolContext): Promise<string> {
-  const b = resolveBinding(ctx.settings, 'embedding');
-  const cap = resolveCapability(pickOf(b), 'embed');
   const texts = Array.isArray(input.texts) ? (input.texts as string[]) : [String(input.text ?? '')];
-  const vectors = await cap.embed.embed(b, mmCtx(ctx), texts);
+  const vectors = await ctx.gateway.embed(ctx.settings, texts, gctx(ctx));
   return JSON.stringify(texts.length === 1 ? vectors[0] : vectors);
 }
 
 async function doRerank(input: Record<string, unknown>, ctx: ToolContext): Promise<string> {
-  const b = resolveBinding(ctx.settings, 'rerank');
-  const cap = resolveCapability(pickOf(b), 'rerank');
   const query = String(input.query ?? '');
   const documents = Array.isArray(input.documents) ? (input.documents as string[]) : [];
   const topN = Number(input.topN ?? documents.length);
   if (!query || documents.length === 0) throw new Error('缺少 query 或 documents');
-  const hits = await cap.rerank.rerank(b, mmCtx(ctx), { query, documents, topN });
+  const hits = await ctx.gateway.rerank(ctx.settings, { query, documents, topN }, gctx(ctx));
   const lines = hits.map((r, i) => `${i + 1}. [相关性 ${r.score !== undefined ? r.score.toFixed(4) : '?'}] ${documents[r.index] ?? '?'}`);
   return `重排序结果（${lines.length} 条）：\n${lines.join('\n')}`;
 }
 
 async function doImageGenerate(input: Record<string, unknown>, ctx: ToolContext): Promise<unknown> {
-  const b = resolveBinding(ctx.settings, 'image-generation');
-  const cap = resolveCapability(pickOf(b), 'image-generate');
   const prompt = String(input.prompt ?? '').trim();
   if (!prompt) throw new Error('缺少 prompt 参数');
   const stopTicker = startTicker(ctx, '图像生成中');
   try {
-    const outputs = await cap.image.generate(b, mmCtx(ctx), {
-      prompt,
-      size: input.size ? String(input.size) : undefined,
-      ratio: input.ratio ? String(input.ratio) : undefined,
-    });
+    const outputs = await ctx.gateway.generateImage(
+      ctx.settings,
+      {
+        prompt,
+        size: input.size ? String(input.size) : undefined,
+        ratio: input.ratio ? String(input.ratio) : undefined,
+      },
+      gctx(ctx),
+    );
     if (outputs.length === 0) throw new Error('图像生成响应为空');
     const dataUrls = await Promise.all(outputs.map(toDataUrl));
     const saved: string[] = [];
@@ -124,22 +80,24 @@ async function doImageGenerate(input: Record<string, unknown>, ctx: ToolContext)
   }
 }
 
-/** 图生图（仅 Agnes 图像 profile 提供 edit；其余接口在 resolveCapability 解析时给出换绑指引） */
+/** 图生图（仅 Agnes 图像实现提供 edit；其余实现在 gateway 显式报错并给出换绑指引） */
 async function doImageEdit(input: Record<string, unknown>, ctx: ToolContext): Promise<unknown> {
-  const b = resolveBinding(ctx.settings, 'image-generation');
-  const cap = resolveCapability(pickOf(b), 'image-edit');
   const prompt = String(input.prompt ?? '').trim();
   const imageInputs = Array.isArray(input.image) ? (input.image as string[]) : [];
   if (!prompt) throw new Error('缺少 prompt 参数');
   if (imageInputs.length === 0) throw new Error('缺少 image 参数（参考图 URL 或本地文件路径）');
   const stopTicker = startTicker(ctx, '图像编辑中');
   try {
-    const outputs = await cap.image.edit!(b, mmCtx(ctx), {
-      prompt,
-      images: imageInputs,
-      size: input.size ? String(input.size) : undefined,
-      ratio: input.ratio ? String(input.ratio) : undefined,
-    });
+    const outputs = await ctx.gateway.editImage(
+      ctx.settings,
+      {
+        prompt,
+        images: imageInputs,
+        size: input.size ? String(input.size) : undefined,
+        ratio: input.ratio ? String(input.ratio) : undefined,
+      },
+      gctx(ctx),
+    );
     if (outputs.length === 0) throw new Error('图像编辑响应为空');
     const dataUrls = await Promise.all(outputs.map(toDataUrl));
     const saved: string[] = [];
@@ -166,7 +124,7 @@ async function downloadVideo(videoUrl: string, ctx: ToolContext): Promise<string
   return saveTemp(ctx.tempDir, ctx.sessionId, `generated-${Date.now()}.mp4`, buf);
 }
 
-function videoRichOutput(path: string, started: number, r: VideoTaskResult): unknown {
+function videoRichOutput(path: string, started: number, r: { url: string; videoId?: string; taskId?: string; model: string; implementation: string }): unknown {
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
   const lines = [`视频已生成（耗时 ${seconds}s）`, `文件：${path}`, `模型：${r.model}（接口实现：${r.implementation}）`];
   if (r.videoId) lines.push(`视频 ID：${r.videoId}`);
@@ -176,59 +134,59 @@ function videoRichOutput(path: string, started: number, r: VideoTaskResult): unk
 }
 
 async function doVideoGenerate(input: Record<string, unknown>, ctx: ToolContext): Promise<unknown> {
-  const b = resolveBinding(ctx.settings, 'video-generation');
-  const cap = resolveCapability(pickOf(b), 'video-generate');
   const prompt = String(input.prompt ?? '').trim();
   if (!prompt) throw new Error('缺少 prompt 参数');
   const started = Date.now();
-  const result = await cap.video.videoFromText(b, mmCtx(ctx), {
-    prompt,
-    seconds: input.seconds ? String(input.seconds) : undefined,
-    aspectRatio: input.aspectRatio ? String(input.aspectRatio) : undefined,
-    pollIntervalMs: input.pollIntervalMs ? Number(input.pollIntervalMs) : undefined,
-  });
+  const result = await ctx.gateway.generateVideo(
+    ctx.settings,
+    {
+      prompt,
+      seconds: input.seconds ? String(input.seconds) : undefined,
+      aspectRatio: input.aspectRatio ? String(input.aspectRatio) : undefined,
+      pollIntervalMs: input.pollIntervalMs ? Number(input.pollIntervalMs) : undefined,
+    },
+    gctx(ctx),
+  );
   const path = await downloadVideo(result.url, ctx);
   return videoRichOutput(path, started, result);
 }
 
-/** 图生视频：首帧素材的 URL/本地路径规则、尾帧支持性、mode 值探测等差异在 profile 内 */
+/** 图生视频：首帧素材的 URL/本地路径规则、尾帧支持性、mode 值探测等差异在引擎内 */
 async function doVideoFromFrame(input: Record<string, unknown>, ctx: ToolContext): Promise<unknown> {
-  const b = resolveBinding(ctx.settings, 'video-generation');
-  const cap = resolveCapability(pickOf(b), 'video-from-frame');
   const prompt = String(input.prompt ?? '').trim();
   const firstFrame = String(input.firstFrame ?? '').trim();
   if (!prompt) throw new Error('缺少 prompt 参数');
   if (!firstFrame) throw new Error('缺少 firstFrame 参数（首帧图片 URL）');
   const started = Date.now();
-  const result = await cap.video.videoFromFrame(b, mmCtx(ctx), {
-    prompt,
-    firstFrame,
-    lastFrame: input.lastFrame ? String(input.lastFrame) : undefined,
-    seconds: input.seconds ? String(input.seconds) : undefined,
-    aspectRatio: input.aspectRatio ? String(input.aspectRatio) : undefined,
-    pollIntervalMs: input.pollIntervalMs ? Number(input.pollIntervalMs) : undefined,
-  });
+  const result = await ctx.gateway.videoFromFrame(
+    ctx.settings,
+    {
+      prompt,
+      firstFrame,
+      lastFrame: input.lastFrame ? String(input.lastFrame) : undefined,
+      seconds: input.seconds ? String(input.seconds) : undefined,
+      aspectRatio: input.aspectRatio ? String(input.aspectRatio) : undefined,
+      pollIntervalMs: input.pollIntervalMs ? Number(input.pollIntervalMs) : undefined,
+    },
+    gctx(ctx),
+  );
   const path = await downloadVideo(result.url, ctx);
   return videoRichOutput(path, started, result);
 }
 
 async function doTts(input: Record<string, unknown>, ctx: ToolContext): Promise<unknown> {
-  const b = resolveBinding(ctx.settings, 'tts');
-  const cap = resolveCapability(pickOf(b), 'tts');
   const text = String(input.text ?? '').trim();
   if (!text) throw new Error('缺少 text 参数');
-  const buf = await cap.tts.tts(b, mmCtx(ctx), { text, voice: input.voice !== undefined ? String(input.voice) : undefined });
+  const buf = await ctx.gateway.tts(ctx.settings, { text, voice: input.voice !== undefined ? String(input.voice) : undefined }, gctx(ctx));
   const path = await saveTemp(ctx.tempDir, ctx.sessionId, `tts-${Date.now()}.mp3`, buf);
   return richOutput({ text: `语音已生成：\n${path}`, files: [{ path, name: basename(path), kind: 'audio' }] });
 }
 
 async function doAsr(input: Record<string, unknown>, ctx: ToolContext): Promise<string> {
-  const b = resolveBinding(ctx.settings, 'asr');
-  const cap = resolveCapability(pickOf(b), 'asr');
   const file = String(input.file ?? '').trim();
   if (!file) throw new Error('缺少 file 参数（本地音频文件路径）');
   const buffer = await fs.readFile(file);
-  return cap.asr.asr(b, mmCtx(ctx), { buffer, filename: basename(file) });
+  return ctx.gateway.asr(ctx.settings, { buffer, filename: basename(file) }, gctx(ctx));
 }
 
 // ---------- 工具定义 ----------
@@ -253,7 +211,7 @@ export const rerankTool: ToolDef = {
     type: 'object',
     properties: {
       query: { type: 'string', description: '查询' },
-      documents: { type: 'array', items: { type: 'string' }, description: '文档列表' },
+      documents: { type: 'array', items: { type: 'string' }, description: '排序文档数组' },
       topN: { type: 'number', description: '返回前 N 条，默认全部' },
     },
     required: ['query', 'documents'],

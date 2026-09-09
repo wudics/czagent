@@ -1,10 +1,11 @@
 # czagent
 
-跨平台桌面 AI 智能体（Electron + React + Node + TypeScript），支持多 Provider 大模型（DeepSeek / SiliconFlow / Agnes 及任意 OpenAI 兼容服务）、工具调用与权限系统、技能（Skills）、MCP、脚本编排、多模态生成（图像/视频/语音）、任务清单与子代理派发。
+跨平台桌面 AI 智能体（Electron + React + Node + TypeScript），支持多 Provider 大模型（DeepSeek / SiliconFlow / Agnes / BigModel / Qwen / OpenRouter 及任意 OpenAI 兼容服务）、工具调用与权限系统、技能（Skills）、MCP、脚本编排、多模态生成（图像/视频/语音）、任务清单与子代理派发。
 
 ## 功能总览
 
 - **对话会话**：流式输出、思考模式、上下文压缩、附件理解、自动标题
+- **模型管理**：模型为中心（每条自带接口实现/地址/Key）；每家 provider 独立引擎实现，统一网关路由与校验；能力绑定（embedding/rerank/图像/视频/语音/图像理解）用户手动设置默认
 - **工具系统**：21 个内置工具（文件读写/搜索/bash/网络/多媒体等）+ MCP 服务器接入；**逐工具矩阵**控制加载与权限
 - **Agent**：内置 Build/Plan，自定义 Agent 可视化配置（工具、MCP、技能逐条开关）
 - **脚本编排**：工作目录入口文件（`czagent.ts`）→ node 子进程执行，第三方包可用，`ctx.tools` / `ctx.agent.run` / `ctx.log` / `ctx.ask`

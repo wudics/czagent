@@ -20,6 +20,11 @@ function sanitize(id: string): string {
   return id.replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
+/** MCP 工具 id 的服务器前缀：`mcp_<sanitize(server)>_`（脚本 ctx.use 门控/懒加载按前缀归属服务器，I19） */
+export function mcpServerPrefix(server: string): string {
+  return `mcp_${sanitize(server)}_`;
+}
+
 /** MCP 工具结果（content 数组）→ 纯文本 */
 function contentToText(content: unknown): string {
   const arr = Array.isArray(content) ? content : [];

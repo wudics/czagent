@@ -106,8 +106,9 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
   const { t } = useTranslation();
   const updateAgent = useSettingsStore((s) => s.updateAgent);
   const removeAgent = useSettingsStore((s) => s.removeAgent);
-  const allModels = useSettingsStore((s) => s.settings.models);
-  const chatModels = useMemo(() => allModels.filter((m) => m.capability === 'chat' && m.enabled), [allModels]);
+  // selector 只选稳定引用（settings），派生数组在组件内 useMemo（避免 snapshot 不稳定引发无限重渲染）
+  const chatSettings = useSettingsStore((s) => s.settings);
+  const chatModels = useMemo(() => chatSettings.chatModels.filter((m) => m.enabled), [chatSettings.chatModels]);
   const sessions = useSessionsStore((s) => s.sessions);
   const activeId = useSessionsStore((s) => s.activeId);
   const [mcpEntries, setMcpEntries] = useState<McpLayerEntry[]>([]);
@@ -178,7 +179,7 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
             <option value="">—</option>
             {chatModels.map((m) => (
               <option key={m.id} value={m.id}>
-                {m.name}
+                {m.displayName}
               </option>
             ))}
           </Select>

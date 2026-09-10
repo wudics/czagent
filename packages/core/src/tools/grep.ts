@@ -18,7 +18,8 @@ function toRegExp(pattern: string): RegExp {
 
 export const grepTool: ToolDef = {
   id: 'grep',
-  description: '在工作目录中按正则或关键字搜索文件内容，返回 file:line:content 匹配行。',
+  description:
+    '在工作目录中按正则或关键字搜索文件内容，返回 file:line:content 匹配行（上限 60 条）。找函数/类定义、配置项、调用点等用它；只知道文件名用 glob。\n用法：结果过多时用 include 收窄文件类型（如 *.ts）或用 path 限定目录；pattern 写正则，非法时自动按字面匹配。',
   inputSchema: {
     type: 'object',
     properties: {

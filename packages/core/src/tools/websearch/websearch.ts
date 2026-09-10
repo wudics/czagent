@@ -48,7 +48,7 @@ function engineOrder(settings: ToolContext['settings']): SearchEngine[] {
 export const websearchTool: ToolDef = {
   id: 'websearch',
   description:
-    '搜索网页获取结果列表（标题/链接/摘要）；先搜索浏览结果，再对高匹配条目使用 webfetch 抓取详情页全文',
+    '联网搜索，返回结果列表（标题/链接/摘要，多引擎聚合去重）。适合调研类、时效性问题（新技术/版本/文档/新闻）。\n用法：query 用具体关键词，可从不同角度多次搜索；先搜索浏览结果，再对高匹配条目用 webfetch 抓取详情页全文。',
   inputSchema: {
     type: 'object',
     properties: {

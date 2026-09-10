@@ -2,7 +2,8 @@ import type { ToolDef, ToolContext } from './types.js';
 
 export const planTool: ToolDef = {
   id: 'plan',
-  description: '提交实施计划（Plan 模式）：把调研结论整理为清晰的分步计划；提交后可调用 plan-exit 请求用户确认执行',
+  description:
+    '提交实施计划（Plan 模式专用）：把调研结论整理为清晰的分步计划（Markdown）。计划应完整覆盖实施步骤、涉及文件与验证方式，同时保持简洁。提交后调用 plan-exit 请求用户确认执行。',
   inputSchema: {
     type: 'object',
     properties: {
@@ -10,16 +11,18 @@ export const planTool: ToolDef = {
     },
     required: ['plan'],
   },
-  async execute(input) {
+  async execute(input, ctx: ToolContext) {
     const plan = String(input.plan ?? '').trim();
     if (!plan) throw new Error('缺少 plan 参数');
+    ctx.savePlan?.(plan);
     return `计划已提交（共 ${plan.length} 字）。如需开始执行，请调用 plan-exit 工具请求用户确认切换到 Build 模式。`;
   },
 };
 
 export const planExitTool: ToolDef = {
   id: 'plan-exit',
-  description: '请求结束 Plan 模式并切换到 Build 模式执行计划（需用户在会话中确认）',
+  description:
+    '请求结束 Plan 模式并切换到 Build 模式执行计划。会向用户弹出确认（用户拒绝则留在 Plan 模式）；确认通过后按已批准的计划开始执行。',
   inputSchema: {
     type: 'object',
     properties: {},

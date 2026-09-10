@@ -1,4 +1,6 @@
-import { homedir } from 'node:os';
+import { homedir, release, type } from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { promises as fs } from 'node:fs';
 import { basename, join } from 'node:path';
 import type {
@@ -42,6 +44,9 @@ import { checkPermission, classifyBashCommand, extractTargetPath, pathInside, re
 import { patchFilePaths } from '../tools/patch.js';
 import { attachmentKind, imageToDataUrl, parseAttachmentToText, textToMessagePart } from './attachments.js';
 import { estimateRequestTokens, pruneHistory, selectTailStart, tailBudget, truncateToolOutput, usageTotal } from '../compaction.js';
+import { appendTurnReminder, buildTurnReminder } from '../reminders.js';
+import { loadProjectInstructions, renderProjectInstructions, type InstructionsCacheEntry } from '../instructions.js';
+import { composeSystemPrompt, SUB_AGENT_ADDENDUM } from '../settings-defaults.js';
 
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 
@@ -133,8 +138,9 @@ function buildRequestMessages(
   agentSystemPrompt?: string,
   env?: string,
   includeImages = true,
+  reminder?: string,
 ): LLMChatMessage[] {
-  const out: LLMChatMessage[] = [];
+  let out: LLMChatMessage[] = [];
   const systemParts = [
     agentSystemPrompt,
     env ? `<env>\n${env}\n</env>` : '',
@@ -200,6 +206,8 @@ function buildRequestMessages(
       });
     }
   }
+  // 逐轮提醒：请求时拼装（不落库），追加到最后一条消息（新输入轮为 user，工具续轮为 tool）
+  out = appendTurnReminder(out, reminder ?? '');
   return out;
 }
 
@@ -215,6 +223,12 @@ export class SessionManager implements AgentProvider {
   private readonly pendingQuestions = new Map<string, (answer: string) => void>();
   /** 会话任务清单（todo 工具）：内存缓存 + sessions.todo 列持久化（I18），重启后面板可恢复 */
   private readonly todos = new Map<string, TodoItem[]>();
+  /** plan 工具最近提交的计划文本（模式切换提醒锚定用；跨 runLoop 保留，会话删除时清理） */
+  private readonly lastPlans = new Map<string, string>();
+  /** AGENTS.md 指令缓存（cwd → {mtime,size,content}，文件变更自动失效） */
+  private readonly instructionsCache = new Map<string, InstructionsCacheEntry>();
+  /** Git 分支名缓存（cwd → 分支，会话生命周期内变化少，接受轻微过期） */
+  private readonly gitBranchCache = new Map<string, string>();
   /** 正在运行的 runLoop 数（并发槽位） */
   private activeLoops = 0;
   /** 等待槽位的会话队列（sessionId） */
@@ -303,6 +317,7 @@ export class SessionManager implements AgentProvider {
     const qi = this.queue.indexOf(id);
     if (qi >= 0) this.queue.splice(qi, 1);
     this.todos.delete(id);
+    this.lastPlans.delete(id);
     this.opts.db.storage.deleteSession(id);
     // 清理该会话的附件 temp 目录
     if (this.opts.attachmentsDir) {
@@ -668,15 +683,26 @@ export class SessionManager implements AgentProvider {
     const history = pruneHistory(this.historyWindow(sessionId).messages);
     const envBlock = await this.buildEnvBlock(cwd, agent, settings);
     const mcpTools = await this.mcpToolsFor(cwd, agent, new Set<string>());
-    const requestMessages = buildRequestMessages(history, agent?.systemPrompt, envBlock + mcpNoteOf(mcpTools), visionOk(model));
+    const requestMessages = buildRequestMessages(history, composeSystemPrompt(agent), envBlock + mcpNoteOf(mcpTools), visionOk(model));
     const est = estimateRequestTokens(requestMessages);
     const used = this.lastCompactionIndex(history) >= 0 ? est : Math.max(est, lastUsageTokens(history));
     return { used, limit: contextLimitOf(model) };
   }
 
-  /** 请求 env 块：平台/工作目录/日期 + 可用技能清单（runLoop 与上下文估算共用，保证口径一致） */
+  /** 请求 env 块：平台/OS/工作目录/日期 + Git 仓库状态 + AGENTS.md 指令 + 可用技能清单（runLoop 与上下文估算共用，保证口径一致） */
   private async buildEnvBlock(cwd: string, agent: AgentDef | undefined, settings: Settings): Promise<string> {
-    let envBlock = `当前系统平台：${process.platform} (${process.arch})\n会话工作目录：${cwd}\n当前日期：${new Date().toISOString().slice(0, 10)}`;
+    const osLine = `${type()} ${release()} (${process.arch})`;
+    let envBlock = `当前系统平台：${process.platform} (${process.arch})\n操作系统：${osLine}\n会话工作目录：${cwd}\n当前日期：${new Date().toISOString().slice(0, 10)}`;
+    // Git 仓库状态（cwd 级缓存，采集失败静默视为非仓库）
+    const git = await this.gitInfoOf(cwd);
+    if (git) envBlock += `\nGit 仓库：是（分支 ${git}）`;
+    // AGENTS.md 项目指令（P1：instructions 槽位，mtime 缓存）
+    try {
+      const instructions = await loadProjectInstructions(cwd, this.instructionsCache);
+      envBlock += renderProjectInstructions(instructions);
+    } catch {
+      // 指令加载失败不影响会话
+    }
     // 技能发现：有技能则注入 <available_skills>，agent 按需用 skill 工具加载
     // I13.3：逐条(skillOverrides) + 全局禁用名单，取 load(s)
     try {
@@ -686,12 +712,27 @@ export class SessionManager implements AgentProvider {
         envBlock +=
           '\n\n<available_skills>\n' +
           skills.map((s) => `- ${s.name}: ${s.description}`).join('\n') +
-          '\n</available_skills>\n当任务与上述技能描述匹配时，先用 skill 工具（{name}）加载其完整说明，再按说明行动。';
+          '\n</available_skills>\n当任务与上述技能描述匹配时，先调用 skill 工具加载其完整说明（name 参数填技能名），再按说明行动。';
       }
     } catch {
       // 技能扫描失败不影响会话
     }
     return envBlock;
+  }
+
+  /** Git 分支名（cwd 级缓存；非仓库/无 git 可执行文件 → null） */
+  private async gitInfoOf(cwd: string): Promise<string | null> {
+    const cached = this.gitBranchCache.get(cwd);
+    if (cached) return cached;
+    try {
+      const { stdout } = await promisify(execFile)('git', ['branch', '--show-current'], { cwd, timeout: 3000 });
+      const branch = stdout.trim();
+      if (!branch) return null;
+      this.gitBranchCache.set(cwd, branch);
+      return branch;
+    } catch {
+      return null;
+    }
   }
 
   /** MCP 工具清单：按 agent 生效服务器名单（全开=全局 enabled 且非 off；受限=点名 on），剔除运行中禁用项 */
@@ -1318,7 +1359,7 @@ export class SessionManager implements AgentProvider {
       parts: [{ type: 'text', text: prompt }],
       createdAt: 0,
     };
-    const messages = buildRequestMessages([promptMsg], agentDef?.systemPrompt, envBlock, target.vision);
+    const messages = buildRequestMessages([promptMsg], composeSystemPrompt(agentDef) + '\n\n' + SUB_AGENT_ADDENDUM, envBlock, target.vision);
 
     let finalText = '';
     let streamAcc = '';
@@ -1543,6 +1584,8 @@ export class SessionManager implements AgentProvider {
     let doomCount = 0;
     // 步数耗尽标记：仅当显式设置了最大步数并跑满时为 true（留空=不限，永不触发）
     let stepsExhausted = false;
+    // 上一轮生效的 agent id（检测 plan→build 切换，供切换提醒一次性注入）
+    let prevAgentId = agent?.id;
 
     try {
       let turn = 0;
@@ -1572,6 +1615,15 @@ export class SessionManager implements AgentProvider {
         const tools = baseTools.concat(mcpTools);
         const mcpNote = mcpNoteOf(mcpTools);
         const canTool = turnTarget.toolcall;
+        // 逐轮提醒（P0-1）：模式约束/计划锚定/todo 进度/步数预警；prevAgentId 在本轮请求组装后才更新
+        const turnReminder = buildTurnReminder({
+          agentId: turnAgent?.id,
+          prevAgentId,
+          todos: this.todos.get(sessionId) ?? [],
+          turn,
+          maxSteps,
+          lastPlan: this.lastPlans.get(sessionId),
+        });
         // 上下文压缩：溢出检测（估算 ∨ 上次真实 usage）→ 摘要 checkpoint → 仍超限丢最旧重试 ≤1；
         // contextLimit<=0 / auto=false 时跳过；工具输出持续 prune（请求侧，DB 不动）
         const compactUsable = this.compactionUsable(turnTarget.contextLimit, settings);
@@ -1579,7 +1631,7 @@ export class SessionManager implements AgentProvider {
         let history = pruneHistory(window0.messages);
         // 窗口饱和（>300 条且窗口内无可见 checkpoint）→ 即使 token 未超预算也强制压缩，避免历史被静默丢弃
         const saturationCompact = window0.saturated && settings.general.compaction.auto;
-        let requestMessages = buildRequestMessages(history, turnAgent?.systemPrompt, envBlock + mcpNote, turnTarget.vision);
+        let requestMessages = buildRequestMessages(history, composeSystemPrompt(turnAgent), envBlock + mcpNote, turnTarget.vision, turnReminder);
         let est = Math.max(estimateRequestTokens(requestMessages), lastUsageTokens(history));
         if ((compactUsable !== null && est >= compactUsable) || saturationCompact) {
           // 饱和触发的压缩不依赖 token 预算：usable 传极大值（尾部预算钳到 15k + 条数上限 200）
@@ -1592,17 +1644,18 @@ export class SessionManager implements AgentProvider {
             usable: compactUsable ?? Number.MAX_SAFE_INTEGER,
           });
           history = pruneHistory(this.historyWindow(sessionId).messages);
-          requestMessages = buildRequestMessages(history, turnAgent?.systemPrompt, envBlock + mcpNote, turnTarget.vision);
+          requestMessages = buildRequestMessages(history, composeSystemPrompt(turnAgent), envBlock + mcpNote, turnTarget.vision, turnReminder);
           est = Math.max(estimateRequestTokens(requestMessages), lastUsageTokens(history));
           if (compactUsable !== null && est >= compactUsable) {
             const start = this.lastCompactionIndex(history) === 0 ? 1 : 0;
             if (start < history.length) {
               // 丢弃最旧一条非 checkpoint 消息（保留摘要 checkpoint），仅重试一次
               history = pruneHistory(history.slice(0, start).concat(history.slice(start + 1)));
-              requestMessages = buildRequestMessages(history, turnAgent?.systemPrompt, envBlock + mcpNote, turnTarget.vision);
+              requestMessages = buildRequestMessages(history, composeSystemPrompt(turnAgent), envBlock + mcpNote, turnTarget.vision, turnReminder);
             }
           }
         }
+        prevAgentId = turnAgent?.id ?? prevAgentId;
         // 上下文仪表：复用本轮请求估算（含 system prompt/env/MCP 说明），零额外计算；
         // 窗口含 checkpoint 时上次真实 usage 口径失效（测量自压缩前更大的窗口），改用纯估算。
         // 溢出检测用的 est 保持 max 混合口径，不受影响
@@ -1755,6 +1808,9 @@ export class SessionManager implements AgentProvider {
                   },
                   setAgent: async (agentId) => {
                     await this.patchSession(sessionId, { agentId });
+                  },
+                  savePlan: (plan) => {
+                    this.lastPlans.set(sessionId, plan);
                   },
                   ask: (req) => this.requestPermission(sessionId, cwd, req.tool, req.args as Record<string, unknown>, signal),
                   askUser: (q) => this.askUser(sessionId, signal, q.question, q.options),

@@ -4,7 +4,8 @@ import { resolveToolPath } from './read.js';
 
 export const editTool: ToolDef = {
   id: 'edit',
-  description: '对文件做精确字符串替换。oldText 必须在文件中唯一出现；多匹配/未匹配都会报错。',
+  description:
+    '对文件做精确字符串替换（小步修改首选）。oldText 必须在文件中唯一出现（含缩进），多匹配/未匹配都会报错。\n用法：编辑前先用 read 确认原文，勿凭记忆写 oldText；匹配不唯一时在 oldText 中带上前后几行上下文使其唯一。\n注意：适合点状修改；大范围重构/新建文件用 write，复杂多处改动可用 patch。',
   inputSchema: {
     type: 'object',
     properties: {

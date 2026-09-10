@@ -32,7 +32,8 @@ function htmlToText(html: string): string {
 
 export const webfetchTool: ToolDef = {
   id: 'webfetch',
-  description: '抓取网页并转为文本；超长内容自动落盘并返回预览，可用 read 工具分段读取全文',
+  description:
+    '抓取 URL 并转为文本（HTML 自动去标签）。超过 2000 字符自动落盘并返回预览，用 read 分段读取全文路径。\n用法：仅抓取用户提到或与任务直接相关的 URL，不要猜测编造 URL；配合 websearch 使用（先搜索拿到链接，再抓详情页）。\n注意：失败（404/超时）时可用 websearch 换关键词换源；原始响应超 2MB 会拒绝抓取。',
   inputSchema: {
     type: 'object',
     properties: {

@@ -7,7 +7,7 @@ import type { ToolDef, ToolContext } from './types.js';
 export const questionTool: ToolDef = {
   id: 'question',
   description:
-    '向用户提出一个问题以澄清需求或让用户选择（可给预设选项，用户也能自由输入）。调用后会暂停等待用户回答，回答文本将作为结果返回。仅在任务信息不足、确实需要用户输入时使用，勿滥用。',
+    '向用户提问以澄清需求或让用户在选项间选择。调用后暂停等待回答，回答文本作为结果返回。\n用法：问题要清晰、具体；给出 options 可让用户一键点选（缺省自由输入）。仅在任务信息不足、方向有歧义或需要用户决策时使用；能自行调研解决、或纯属琐碎确认的情况不要调用。',
   inputSchema: {
     type: 'object',
     properties: {

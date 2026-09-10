@@ -12,7 +12,8 @@ const MAX_READ_BYTES = 2 * 1024 * 1024;
 
 export const readTool: ToolDef = {
   id: 'read',
-  description: '读取文件内容（UTF-8）。参数 file 相对当前工作目录或绝对路径；offset/limit 控制返回的行范围。',
+  description:
+    '读取文件内容（UTF-8 文本，单次上限 2MB）。路径相对会话工作目录或绝对路径；offset/limit 控制行范围（默认从头 2000 行）。\n用法：大文件先用小 limit 试探再按需分段；返回头带总行数与当前区间，未读完继续用 offset 接着读。\n注意：二进制/超大文件会报错，改用 grep 定位或 glob 找文件；读取不存在的文件会报错，不确定路径时先用 glob 确认。',
   inputSchema: {
     type: 'object',
     properties: {

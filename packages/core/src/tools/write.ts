@@ -5,7 +5,8 @@ import { resolveToolPath } from './read.js';
 
 export const writeTool: ToolDef = {
   id: 'write',
-  description: '创建或整文件写入（UTF-8）。参数 file 相对当前工作目录或绝对路径；会自动创建父目录。',
+  description:
+    '创建新文件或整体覆写文件（UTF-8），自动创建父目录。路径相对会话工作目录或绝对路径。\n用法：新文件用本工具；修改已有文件优先用 edit（避免整文件覆盖造成意外丢失），确需重写全部内容时才用 write。\n注意：content 必须是完整文件内容（而非追加/片段）；遵循会话工作目录权限边界。',
   inputSchema: {
     type: 'object',
     properties: {

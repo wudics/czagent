@@ -85,13 +85,15 @@ permission: {
 - **node-pty**（`@lydell/node-pty`，Electron 适配版）：
   - Windows → `powershell.exe`
   - Linux/macOS → `bash` / `zsh`
-- 每个会话一个持久 shell 会话（PtyPool 管理），支持：
-  - 交互式命令（`npm init` 提示、编辑器）
-  - Ctrl+C 中断（转发到 pty）
-  - ANSI 颜色保留（渲染层剥离/着色处理）
-- 输出上限：单次命令输出截断（如 30k 字符），超限截断提示。
-- 超时：命令级超时（可配），超时 kill + 报错。
-- **平台差异**：Windows 用 `powershell -NoProfile -Command` 语义，脚本/路径分隔符差异在工具描述中说明；cwd 检查用 `realpath` 归一化路径（大小写、符号链接）防止绕过。
+- 每次调用独立 pty（cwd = 会话工作目录，无需 cd）：
+  - 不支持交互式输入（交互命令挂起直到超时，工具描述引导用非交互参数）
+  - ANSI 颜色剥离（stripAnsi）后返回纯文本
+- 输出上限：单次命令输出截断（30k 字符），超限截断提示。
+- 超时（对齐 opencode shell 工具模式）：
+  - 每调用可选 `timeout` 参数（正整数毫秒，不设上限；负数/0/非整数报错），默认 120000ms
+  - **超时不抛错**：kill 后返回已捕获的部分输出 + `<shell_metadata>` 中文提示（"若命令确实需要更长时间……请传更大的 timeout 参数重试"），`exitCode: 124`（GNU timeout 惯例）
+  - 用户中止：kill 后正常返回部分输出 + "用户中止了命令"，`exitCode: 130`
+- **平台差异**：Windows 用 `powershell -NoProfile -NonInteractive -Command` 语义，脚本/路径分隔符差异在工具描述中说明（平台感知双分支描述）。
 
 ## 5. websearch（决策 17，P2）
 

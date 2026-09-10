@@ -7,7 +7,8 @@ const DEFAULT_IGNORE = ['**/node_modules/**', '**/.git/**', '**/.next/**', '**/d
 
 export const globTool: ToolDef = {
   id: 'glob',
-  description: '按 glob 模式列出文件路径（相对于工作目录）。',
+  description:
+    '按 glob 模式查找文件路径（最多 200 条）。适合"按名称/类型找文件"或不确定文件位置时；按内容搜索用 grep。\n用法：pattern 如 src/**/*.ts、**/package.json；自动忽略 node_modules/.git/dist 等目录；path 限定搜索根目录（默认会话工作目录）。',
   inputSchema: {
     type: 'object',
     properties: {

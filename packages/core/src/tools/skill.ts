@@ -5,11 +5,11 @@ import { scanSkills } from '../skills/discovery.js';
 export const skillTool: ToolDef = {
   id: 'skill',
   description:
-    '加载可用技能的完整说明。当任务与 system 提示中 <available_skills> 列表的某项匹配时，先用本工具加载该技能的正文，再按其指导行动',
+    '加载可用技能的完整说明。仅当任务与 system 提示 <available_skills> 列表中某项技能的描述匹配时调用；name 必须取自该列表。加载后严格按技能正文行动；任务不匹配时不要调用本工具',
   inputSchema: {
     type: 'object',
     properties: {
-      name: { type: 'string', description: '技能名称（见 available_skills 列表）' },
+      name: { type: 'string', description: '技能名称（必须取自 available_skills 列表）' },
     },
     required: ['name'],
   },
@@ -22,9 +22,13 @@ export const skillTool: ToolDef = {
     const skills = (await scanSkills(ctx.cwd, ctx.builtinSkillsDir)).filter((s) =>
       allowed ? allowed.includes(s.name) : !(ctx.settings.general.disabledSkills ?? []).includes(s.name),
     );
-    const skill = skills.find((s) => s.name === name);
+    const skill = skills.find((s) => s.name === name) ?? skills.find((s) => s.name.toLowerCase() === name.toLowerCase());
     if (!skill) {
-      throw new Error(`未找到技能：${name}（可用：${skills.map((s) => s.name).join('、') || '无'}）`);
+      // 不 throw：返回引导文本让模型自行纠正（错误路径会计入 doom-loop 且不利于重试）
+      if (skills.length === 0) {
+        return `未找到技能「${name}」，当前无可用技能。请直接完成任务，不要再调用本工具。`;
+      }
+      return `未找到技能「${name}」。可用技能：${skills.map((s) => s.name).join('、')}。请从上述列表中选择正确的技能名重试；若均不匹配，直接完成任务即可。`;
     }
     return skill.body;
   },

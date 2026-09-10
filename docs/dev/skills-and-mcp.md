@@ -38,8 +38,8 @@ metadata:
 
 ### 1.3 使用
 
-- System prompt 注入 `<available_skills>` 列表（名称 + 描述），agent 按任务判断是否加载。
-- `skill` 工具：`{ name }` → 读取 SKILL.md 正文注入上下文（reference 化），技能内允许调用的工具按 `allowed-tools` 约束。
+- System prompt 注入 `<available_skills>` 列表（名称 + 描述 + 使用指引），agent 按任务判断是否加载。
+- `skill` 工具：`{ name }` → 读取 SKILL.md 正文注入上下文（reference 化），技能内允许调用的工具按 `allowed-tools` 约束。名字匹配先精确后大小写不敏感；未找到**不抛错**，返回引导文本（可用技能清单），避免 doom-loop 误触发、模型可自行纠正；`{name}` 占位符已移除（原指引行中的字面 `{name}` 未被替换的 bug 已修复）。
 - 卸载：每次回复后按规则释放技能上下文，避免污染后续对话。
 
 ## 2. MCP（决策 19：官方 SDK）

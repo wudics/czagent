@@ -56,17 +56,33 @@ async function runLoop(session, agent):
 
 ```
 system = [
-  agent.prompt ?? defaultBuildPrompt,     # build/plan/自定义 agent 的系统提示词
-  env,                                     # 模型身份行 + <env>：cwd、workspace 根、平台、日期
-  instructions,                            # 用户指令（会话/全局，类似 AGENTS.md 语义）
-  skills,                                  # (P2) 可用 skill 列表 <available_skills>
-  mcpInstructions,                         # (P2) MCP server 指令
+  BASE_PROMPT,                             # 基础行为规范（代码常量，settings-defaults.ts；随版本演进免迁移）
+  agent.prompt,                            # build/plan/自定义 agent 的系统提示词（用户可编辑，composeSystemPrompt 拼接）
+  <env>                                    # 平台/OS/会话 cwd/日期 + Git 仓库状态（分支，cwd 缓存）
+                                           #   + <project_instructions>（AGENTS.md，mtime 缓存，截 10k 字符）
+                                           #   + <available_skills>（技能名+描述+使用指引）
+                                           #   + <mcp_instructions>（MCP 工具清单）
 ]
+# 子代理（task 派遣）：composeSystemPrompt(agent) + SUB_AGENT_ADDENDUM（自包含报告/不提问约束）
 ```
 
 - 内置 `build`（默认）：完整工具集，自主完成任务。
 - 内置 `plan`：只读工具集 + plan 提示词（先调研、列计划、不擅自改代码），可被 agent 通过 `plan` 工具进入、`plan-exit` 退出（决策 18，参考 opencode `plan-enter/plan-exit.txt`）。
 - 提示词文案可直接参考 `docs/ref/opencode-prompt-cn/` 的中文版。
+- 项目指令：仅识别会话 cwd 下的 `AGENTS.md`（`core/src/instructions.ts`），实例级 mtime+size 缓存；空文件不产生注入段。
+
+### 3.1 逐轮 `<system-reminder>` 注入（`core/src/reminders.ts`）
+
+请求时拼装、**不落库**：`buildRequestMessages()` 末尾把 `buildTurnReminder(ctx)` 的结果以 `<system-reminder>` 块追加到消息数组**最后一条消息**（新输入轮为 user，工具续轮为 tool；与 todo 工具结果尾注同一先例）。token 计入 `estimateRequestTokens`（预算口径正确）。四类触发条件：
+
+| 提醒 | 条件 | 作用 |
+|---|---|---|
+| Plan 只读约束 | `agentId === 'plan'`（每轮） | 只读约束不随长上下文稀释，明确"优先于历史中的修改请求" |
+| 模式切换锚定 | `prevAgentId==='plan' && agentId==='build'`（仅切换后首轮） | 携带 `lastPlans` 缓存的计划全文（截 4000 字符），防止重新调研/偏离已批准范围 |
+| todo 进度快照 | 清单存在且未全 completed（每轮） | 复用 todoToText 渲染（截 1500 字符），防进度漂移 |
+| max-steps 预警 | 上限有限且剩余 ≤3 轮 | 要求收尾汇总，不开启新的大步骤 |
+
+配套：`ToolContext.savePlan` 由 plan 工具调用缓存计划文本（SessionManager 内存 Map，会话删除时清理）；`prevAgentId` 在每轮请求组装后更新。
 
 ## 4. 终止条件与 max steps
 

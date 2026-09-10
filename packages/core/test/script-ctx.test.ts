@@ -131,7 +131,7 @@ describe('skillTool allowedSkills', () => {
       ...(allowedSkills ? { allowedSkills } : {}),
     }) as unknown as ToolContext;
 
-  it('白名单覆盖全局禁用：名单内可用、名单外拒绝；缺省跟随全局', { timeout: 15_000 }, async () => {
+  it('白名单覆盖全局禁用：名单内可用、名单外返回引导文本；缺省跟随全局', { timeout: 15_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'czagent-skill-'));
     const skillsDir = join(dir, '.czagent', 'skills');
     mkdirSync(join(skillsDir, 'aaa'), { recursive: true });
@@ -139,13 +139,20 @@ describe('skillTool allowedSkills', () => {
     writeFileSync(join(skillsDir, 'aaa', 'SKILL.md'), '---\nname: skill-aaa\ndescription: a\n---\nAAA-BODY', 'utf8');
     writeFileSync(join(skillsDir, 'bbb', 'SKILL.md'), '---\nname: skill-bbb\ndescription: b\n---\nBBB-BODY', 'utf8');
 
-    // 权威覆盖：skill-aaa 虽被全局禁用，白名单点名即可用；skill-bbb 不在名单内被拒
+    // 权威覆盖：skill-aaa 虽被全局禁用，白名单点名即可用；skill-bbb 不在名单内 → 引导文本（不抛错）
     expect(await skillTool.execute({ name: 'skill-aaa' }, mkCtx(dir, ['skill-aaa']))).toContain('AAA-BODY');
-    await expect(skillTool.execute({ name: 'skill-bbb' }, mkCtx(dir, ['skill-aaa']))).rejects.toThrowError(/未找到技能：skill-bbb/);
+    const notAllowed = String(await skillTool.execute({ name: 'skill-bbb' }, mkCtx(dir, ['skill-aaa'])));
+    expect(notAllowed).toContain('未找到技能「skill-bbb」');
+    expect(notAllowed).toContain('skill-aaa');
 
     // 缺省：跟随全局 disabledSkills（skill-aaa 被禁、skill-bbb 可用）
-    await expect(skillTool.execute({ name: 'skill-aaa' }, mkCtx(dir))).rejects.toThrowError(/未找到技能：skill-aaa/);
+    const disabled = String(await skillTool.execute({ name: 'skill-aaa' }, mkCtx(dir)));
+    expect(disabled).toContain('未找到技能「skill-aaa」');
+    expect(disabled).toContain('skill-bbb');
     expect(await skillTool.execute({ name: 'skill-bbb' }, mkCtx(dir))).toContain('BBB-BODY');
+
+    // 大小写不敏感兜底匹配
+    expect(await skillTool.execute({ name: 'SKILL-AAA' }, mkCtx(dir, ['skill-aaa']))).toContain('AAA-BODY');
 
     rmSync(dir, { recursive: true, force: true });
   });

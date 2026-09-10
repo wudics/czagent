@@ -19,6 +19,8 @@ export interface ToolContext {
   reportProgress?: (text: string) => void;
   /** 切换会话 agent（plan-exit 用；由 SessionManager 注入） */
   setAgent?: (agentId: string) => Promise<void>;
+  /** 缓存 plan 工具提交的计划文本（模式切换提醒锚定用；由 SessionManager 注入） */
+  savePlan?: (plan: string) => void;
   /** 发起权限询问（返回用户决定） */
   ask(req: Omit<PermissionRequest, 'id'>): Promise<PermissionDecision>;
   /** 向用户提问并等待文本回答（question 工具；缺省 = 不支持 → 返回空） */

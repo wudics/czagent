@@ -87,6 +87,8 @@
   /* ---- markdown 正文排版 ---- */
   .markdown-body {
     @apply text-[14px] leading-relaxed;
+    /* 长链接/长 token 可在任意字符间断行（可继承），并收敛 min-content 防止撑破容器 */
+    overflow-wrap: anywhere;
   }
   .markdown-body > :first-child {
     margin-top: 0;
@@ -132,6 +134,8 @@
   }
   .markdown-body pre {
     @apply my-2 overflow-auto rounded-md bg-muted/70 p-3 text-[12.5px] leading-relaxed;
+    /* 豁免断词：代码块保持行对齐，超宽行在块内横向滚动 */
+    overflow-wrap: normal;
   }
   .markdown-body pre code {
     @apply bg-transparent p-0;

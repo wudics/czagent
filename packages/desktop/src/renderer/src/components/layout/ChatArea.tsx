@@ -194,7 +194,7 @@ export function ChatArea() {
     <div className="relative min-h-0 flex-1">
       <div
         ref={scrollRef}
-        className="h-full overflow-y-auto"
+        className="h-full overflow-x-hidden overflow-y-auto"
         onScroll={handleScroll}
         onWheel={handleWheel}
         onTouchStart={handleTouchStart}

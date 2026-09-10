@@ -22,7 +22,7 @@ function MessageItemInner({ message }: { message: ChatMessage }) {
     <div className={cn('flex gap-3 py-2', isUser && 'flex-row-reverse')}>
       {!isUser && <AssistantAvatar />}
       {isUser ? (
-        <div className="max-w-[85%] space-y-2 rounded-2xl rounded-tr-sm bg-primary px-4 py-2.5 text-sm text-primary-foreground">
+        <div className="min-w-0 max-w-[85%] space-y-2 rounded-2xl rounded-tr-sm bg-primary px-4 py-2.5 text-sm text-primary-foreground">
           {message.parts.map((p, i) => {
             if (p.type === 'image') {
               return (
@@ -38,7 +38,7 @@ function MessageItemInner({ message }: { message: ChatMessage }) {
               return (
                 <div
                   key={i}
-                  className={cn('whitespace-pre-wrap', isScriptUser && 'font-mono text-[12.5px] leading-relaxed')}
+                  className={cn('whitespace-pre-wrap wrap-anywhere', isScriptUser && 'font-mono text-[12.5px] leading-relaxed')}
                 >
                   {p.text}
                 </div>

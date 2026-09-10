@@ -26,7 +26,7 @@ export const CHAT_IMPL_META: ImplMeta[] = [
   { id: 'bigmodel', name: 'BigModel', category: 'chat', defaultBaseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
   { id: 'qwen', name: 'Qwen', category: 'chat', defaultBaseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
   { id: 'openrouter', name: 'OpenRouter', category: 'chat', defaultBaseUrl: 'https://openrouter.ai/api/v1' },
-  { id: 'openai-compatible', name: 'OpenAI 兼容（自定义）', category: 'chat', defaultBaseUrl: '', description: '通用 OpenAI 兼容接口：自填地址与 Key，无平台差异参数' },
+  { id: 'openai-compatible', name: 'OpenAI 兼容', category: 'chat', defaultBaseUrl: '', description: '通用 OpenAI 兼容接口：自填地址与 Key，无平台差异参数' },
 ];
 
 /** 多模态/专用接口实现（按 capability 过滤为对应能力模型的候选） */

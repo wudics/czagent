@@ -17,7 +17,7 @@ function LongText({ text, className }: { text: string; className?: string }) {
     return (
       <pre
         className={cn(
-          'max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-muted/40 p-2 text-[12px] leading-relaxed',
+          'max-h-56 overflow-auto whitespace-pre-wrap wrap-anywhere rounded-md bg-muted/40 p-2 text-[12px] leading-relaxed',
           className,
         )}
       >
@@ -28,7 +28,7 @@ function LongText({ text, className }: { text: string; className?: string }) {
   if (!expanded) {
     return (
       <div className={cn('rounded-md bg-muted/40 p-2 text-[12px] leading-relaxed', className)}>
-        <pre className="whitespace-pre-wrap">{text.slice(0, COLLAPSED_PREVIEW_CHARS)}</pre>
+        <pre className="whitespace-pre-wrap wrap-anywhere">{text.slice(0, COLLAPSED_PREVIEW_CHARS)}</pre>
         <button
           type="button"
           onClick={() => setExpanded(true)}
@@ -41,7 +41,7 @@ function LongText({ text, className }: { text: string; className?: string }) {
   }
   return (
     <div className={cn('rounded-md bg-muted/40 p-2 text-[12px] leading-relaxed', className)}>
-      <pre className="max-h-56 overflow-auto whitespace-pre-wrap">{text}</pre>
+      <pre className="max-h-56 overflow-auto whitespace-pre-wrap wrap-anywhere">{text}</pre>
       <button
         type="button"
         onClick={() => setExpanded(false)}
@@ -66,7 +66,7 @@ export function ReasoningView({ text }: { text: string }) {
         <span>{reasoningLabelText(done ? 'done' : 'pending')}</span>
         {!done && <span className="h-1 w-1 animate-pulse rounded-full bg-current" />}
       </div>
-      <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-muted-foreground italic">
+      <div className="whitespace-pre-wrap wrap-anywhere text-[13px] leading-relaxed text-muted-foreground italic">
         {text}
       </div>
     </div>
@@ -137,7 +137,7 @@ export function CompactionView({ summary }: { summary: string }) {
   return (
     <details className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
       <summary className="cursor-pointer font-medium">历史已压缩 · 点击展开摘要</summary>
-      <div className="mt-1 whitespace-pre-wrap leading-relaxed">{summary}</div>
+      <div className="mt-1 whitespace-pre-wrap wrap-anywhere leading-relaxed">{summary}</div>
     </details>
   );
 }

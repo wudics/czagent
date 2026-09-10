@@ -82,6 +82,7 @@ export const DEFAULT_GENERAL = {
   theme: 'system' as const,
   maxConcurrency: 4,
   titleAutoRounds: 1,
+  continueLoopOnDeny: false,
   websearch: { engines: ['bing', 'baidu', 'so360', 'sogou'], maxResults: 8 },
   compaction: { auto: true, reservedTokens: 20_000, preserveRatio: 0.25 },
   disabledSkills: [],

@@ -67,6 +67,7 @@ export default {
     planReadyHint: 'Switch to Build mode and start executing the plan?',
     planSwitch: 'Switch to Build',
     planLater: 'Not now',
+    planPreview: 'Plan preview',
     loadingHistory: 'Loading history…',
     toolRunning: 'Running',
     toolCompleted: 'Done',

@@ -4,10 +4,11 @@ import type { PermissionDecision } from '@czagent/core';
 import { useSessionsStore } from '../../stores/sessions';
 import { usePermissionsStore } from '../../stores/permissions';
 import { Button } from '../ui/button';
+import { Markdown } from '../markdown/Markdown';
 
 /**
  * 会话内嵌权限卡片（每会话独立渲染，多会话并发互不覆盖）。
- * plan-exit 走同一管线，展示为"计划已就绪"确认卡。
+ * plan-exit 走同一管线，展示为"计划已就绪"确认卡（内嵌计划预览）。
  */
 export function PermissionCard() {
   const { t } = useTranslation();
@@ -21,6 +22,10 @@ export function PermissionCard() {
   const resolve = (decision: PermissionDecision): void => {
     void usePermissionsStore.getState().resolve(item, decision);
   };
+  const planPreview =
+    request.tool === 'plan-exit' && typeof request.args === 'object' && request.args !== null
+      ? String((request.args as Record<string, unknown>).plan ?? '')
+      : '';
 
   if (request.tool === 'plan-exit') {
     return (
@@ -31,6 +36,16 @@ export function PermissionCard() {
             {t('chat.planReadyTitle')}
           </div>
           <p className="mt-1 text-xs text-muted-foreground">{t('chat.planReadyHint')}</p>
+          {planPreview && (
+            <details className="mt-2">
+              <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
+                {t('chat.planPreview')}
+              </summary>
+              <div className="mt-1 max-h-64 overflow-auto rounded-md border border-border bg-muted/40 p-2">
+                <Markdown text={planPreview} className="text-[13px]" />
+              </div>
+            </details>
+          )}
           <div className="mt-2 flex justify-end gap-2">
             <Button variant="ghost" size="sm" onClick={() => resolve('deny')}>
               {t('chat.planLater')}

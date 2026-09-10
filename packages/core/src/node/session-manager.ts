@@ -31,7 +31,7 @@ import { Gateway, type ResolvedChat } from '../llm/gateway.js';
 import type { ChatEngine, ChatReq, LLMChatMessage } from '../llm/types.js';
 import { LLMError, friendlyLLMMessage } from '../llm/errors.js';
 import { createDefaultRegistry, ToolRegistry, INTERNAL_TOOLS } from '../tools/index.js';
-import type { ToolDef } from '../tools/types.js';
+import { UserRejectedError, type ToolDef } from '../tools/types.js';
 import { isRichToolOutput } from '../tools/rich-output.js';
 import { scanSkills, skillEnabled } from '../skills/discovery.js';
 import { effectiveToolLoaded } from '../tools/policy.js';
@@ -180,7 +180,11 @@ function buildRequestMessages(
     const callParts = m.parts.filter(
       (p): p is Extract<MessagePart, { type: 'tool-call' }> => p.type === 'tool-call' && p.tool.trim() !== '',
     );
-    const text = m.parts.filter((p) => p.type === 'text').map((p) => p.text).join('\n');
+    // synthetic text 仅展示不进请求（如 plan 工具的可见计划全文；tool-call 参数里已有一份，避免双份入上下文）
+    const text = m.parts
+      .filter((p): p is Extract<MessagePart, { type: 'text' }> => p.type === 'text' && !p.synthetic)
+      .map((p) => p.text)
+      .join('\n');
     const reasoning = m.parts.filter((p) => p.type === 'reasoning').map((p) => p.text).join('\n');
     const toolCalls = callParts.map((p) => ({
       id: p.callID,
@@ -1256,12 +1260,15 @@ export class SessionManager implements AgentProvider {
       });
       finishCall('completed');
       if (isRichToolOutput(output)) {
-        // 富输出：图片/文件追加为独立 part，tool-result 只收文本
+        // 富输出：图片/文件/markdown 追加为独立 part，tool-result 只收文本
         for (const img of output.images ?? []) {
           append({ type: 'image', dataUrl: img.dataUrl, name: img.name });
         }
         for (const f of output.files ?? []) {
           append({ type: 'file', name: f.name ?? basename(f.path), kind: f.kind ?? 'file', path: f.path });
+        }
+        if (output.markdown) {
+          append({ type: 'text', text: output.markdown.text, synthetic: true });
         }
         append({ type: 'tool-result', callID, output: output.text, state: 'completed' });
         return output.text;
@@ -1584,6 +1591,8 @@ export class SessionManager implements AgentProvider {
     let doomCount = 0;
     // 步数耗尽标记：仅当显式设置了最大步数并跑满时为 true（留空=不限，永不触发）
     let stepsExhausted = false;
+    // 用户拒绝标记：权限/提问被拒后终止本轮（对齐 opencode；continueLoopOnDeny=true 可保留旧行为）
+    let denyStopReason = '';
     // 上一轮生效的 agent id（检测 plan→build 切换，供切换提醒一次性注入）
     let prevAgentId = agent?.id;
 
@@ -1787,6 +1796,7 @@ export class SessionManager implements AgentProvider {
             let result: { output?: unknown; error?: string };
             if (decision === 'deny') {
               result = { error: '用户拒绝了该操作' };
+              if (!settings.general.continueLoopOnDeny) denyStopReason = '你拒绝了本次操作请求';
             } else {
               try {
                 const output = await def.execute(tc.input as Record<string, unknown>, {
@@ -1812,6 +1822,7 @@ export class SessionManager implements AgentProvider {
                   savePlan: (plan) => {
                     this.lastPlans.set(sessionId, plan);
                   },
+                  lastPlan: () => this.lastPlans.get(sessionId),
                   ask: (req) => this.requestPermission(sessionId, cwd, req.tool, req.args as Record<string, unknown>, signal),
                   askUser: (q) => this.askUser(sessionId, signal, q.question, q.options),
                   todo: (input) => this.updateSessionTodo(sessionId, input),
@@ -1842,7 +1853,7 @@ export class SessionManager implements AgentProvider {
                     }),
                 });
                  if (isRichToolOutput(output)) {
-                   // 富输出：图片/文件追加为独立 part（消息流直接呈现），模型只收文本
+                   // 富输出：图片/文件/markdown 追加为独立 part（消息流直接呈现），模型只收文本
                    for (const img of output.images ?? []) {
                      const idx = parts.length;
                      parts[idx] = { type: 'image', dataUrl: img.dataUrl, name: img.name };
@@ -1855,12 +1866,23 @@ export class SessionManager implements AgentProvider {
                      emitPart(assistantId, idx, parts[idx]!, true);
                      storage.updateMessageParts(assistantId, parts);
                    }
+                   if (output.markdown) {
+                     const idx = parts.length;
+                     parts[idx] = { type: 'text', text: output.markdown.text, synthetic: true };
+                     emitPart(assistantId, idx, parts[idx]!, true);
+                     storage.updateMessageParts(assistantId, parts);
+                   }
                    result = { output: output.text };
                  } else {
                    result = { output };
                  }
               } catch (e) {
-                result = { error: String((e as Error)?.message ?? e) };
+                if (e instanceof UserRejectedError) {
+                  result = { error: e.message };
+                  if (!settings.general.continueLoopOnDeny) denyStopReason = e.message;
+                } else {
+                  result = { error: String((e as Error)?.message ?? e) };
+                }
               }
             }
             const callIdx = parts.findIndex((p) => p.type === 'tool-call' && p.callID === tc.callID);
@@ -1877,6 +1899,8 @@ export class SessionManager implements AgentProvider {
             storage.updateMessageParts(assistantId, parts);
           }
           if (signal.aborted) break;
+          // 用户拒绝：终止本轮，不再发起下一次请求（工具结果已落库，配对完整）
+          if (denyStopReason) break;
           // 本轮全部为无效工具调用 → 结束循环，避免空转"一直执行中"
           if (!hadValid) break;
           continue;
@@ -1897,6 +1921,14 @@ export class SessionManager implements AgentProvider {
     if (stepsExhausted && lastAssistantId && !finalized) {
       const idx = lastParts.length;
       lastParts[idx] = { type: 'text', text: '已达单次运行最大步数上限，本轮到此停止。你可以直接输入"继续"，我会接着当前进度往下做。' };
+      emitPart(lastAssistantId, idx, lastParts[idx]!, true);
+      storage.updateMessageParts(lastAssistantId, lastParts);
+    }
+
+    // 用户拒绝后终止：给用户可见提示，避免"无声停止"
+    if (denyStopReason && lastAssistantId && !finalized) {
+      const idx = lastParts.length;
+      lastParts[idx] = { type: 'text', text: `${denyStopReason}，本轮到此停止。补充说明后直接发送即可继续。` };
       emitPart(lastAssistantId, idx, lastParts[idx]!, true);
       storage.updateMessageParts(lastAssistantId, lastParts);
     }
@@ -1930,7 +1962,12 @@ export class SessionManager implements AgentProvider {
           .join(' ')
           .slice(0, 400) ?? '';
       const assistantText =
-        ([...msgs].reverse().find((m) => m.role === 'assistant')?.parts.filter((p) => p.type === 'text').map((p) => p.text).join(' ') ?? '').slice(0, 400);
+        ([...msgs]
+          .reverse()
+          .find((m) => m.role === 'assistant')
+          ?.parts.filter((p): p is Extract<MessagePart, { type: 'text' }> => p.type === 'text' && !p.synthetic)
+          .map((p) => p.text)
+          .join(' ') ?? '').slice(0, 400);
       if (!userText.trim() || !assistantText.trim()) return;
       const title = await this.generateTitle(sessionId, session, settings, userText, assistantText);
       if (!title) return;
@@ -1999,7 +2036,8 @@ export class SessionManager implements AgentProvider {
   ): Promise<void> {
     const storage = this.opts.db.storage;
     const session = storage.getSession(sessionId);
-    const textLength = parts.reduce((n, p) => n + (p.type === 'text' ? p.text.length : 0), 0);
+    // synthetic text（如 plan 可见计划全文）非模型生成输出，不计入用量估算
+    const textLength = parts.reduce((n, p) => n + (p.type === 'text' && !p.synthetic ? p.text.length : 0), 0);
     const reasoningLength = parts.reduce((n, p) => n + (p.type === 'reasoning' ? p.text.length : 0), 0);
     const usage: Usage =
       providerUsage ??

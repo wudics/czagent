@@ -1,6 +1,14 @@
 import type { PermissionDecision, PermissionRequest, Settings } from '../provider.js';
 import type { Gateway } from '../llm/gateway.js';
 
+/** 用户在工具内部询问（ctx.ask）中选择拒绝：runLoop 识别后终止本轮（对齐 opencode 拒绝即停） */
+export class UserRejectedError extends Error {
+  constructor(message = '用户拒绝了本次操作') {
+    super(message);
+    this.name = 'UserRejectedError';
+  }
+}
+
 export interface ToolContext {
   sessionId: string;
   cwd: string;
@@ -21,6 +29,8 @@ export interface ToolContext {
   setAgent?: (agentId: string) => Promise<void>;
   /** 缓存 plan 工具提交的计划文本（模式切换提醒锚定用；由 SessionManager 注入） */
   savePlan?: (plan: string) => void;
+  /** 读取 plan 工具最近提交的计划文本（plan-exit 确认卡预览用；由 SessionManager 注入） */
+  lastPlan?: () => string | undefined;
   /** 发起权限询问（返回用户决定） */
   ask(req: Omit<PermissionRequest, 'id'>): Promise<PermissionDecision>;
   /** 向用户提问并等待文本回答（question 工具；缺省 = 不支持 → 返回空） */

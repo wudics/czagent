@@ -57,7 +57,7 @@ export interface SessionContext {
 }
 
 export type MessagePart =
-  | { type: 'text'; text: string }
+  | { type: 'text'; text: string; /** 仅展示不进请求（如 plan 工具的可见计划全文）；buildRequestMessages 跳过 */ synthetic?: boolean }
   | { type: 'reasoning'; text: string }
   | { type: 'image'; dataUrl: string; name?: string }
   | {
@@ -329,6 +329,8 @@ export interface GeneralSettings {
   maxConcurrency: number;
   /** 会话标题自动生成的轮数上限（前 N 轮可自动更新；0=关闭；用户手动编辑即永久锁定） */
   titleAutoRounds: number;
+  /** 用户拒绝权限/提问后是否继续 agent loop（对齐 opencode：默认 false = 拒绝即停止本轮） */
+  continueLoopOnDeny?: boolean;
   /** 网页搜索（决策 17）：启用引擎（按固定优先级过滤）与结果条数 */
   websearch: {
     engines: string[];

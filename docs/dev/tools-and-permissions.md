@@ -42,7 +42,7 @@ interface ToolCtx {
 | `bash` | 终端命令（node-pty，见 §4） | `bash` + 路径检查 |
 | `webfetch` | 抓取网页 → markdown | `webfetch` |
 | `todowrite` | 维护任务清单（写入会话 todo 列表） | `todowrite` |
-| `plan` / `plan-exit` | 进入/退出 plan 模式（决策 18） | —（模式切换） |
+| `plan` / `plan-exit` | 进入/退出 plan 模式（决策 18）。plan 提交经富输出把计划全文追加为可见 markdown part（用户直接可读，模型只收短文本）；plan-exit 拒绝 → `UserRejectedError` 终止本轮、留在 Plan 模式 | —（模式切换） |
 
 ### 2.2 P2 扩展
 
@@ -77,7 +77,7 @@ permission: {
 
 ### 3.3 询问流程
 - 工具执行前 `ctx.ask(...)` → 主进程发 `permission.request` 事件 → UI 弹窗展示工具名/参数/目标路径，三选一：**允许本次 / 允许本次及以后（写入规则）/ 拒绝**。
-- 拒绝 → 工具返回 error 结果；若为关键拒绝 → 中断 loop（agent-loop.md §2）。
+- 拒绝 → 工具结果记 error 并**终止本轮 loop**（权限层 deny 与工具内 `ctx.ask` 抛 `UserRejectedError` 同一管线，见 agent-loop.md §2）；`general.continueLoopOnDeny = true` 可恢复"错误反馈给模型继续"旧行为。
 - **doom-loop**：同一工具同一参数连续 3 次 → 询问（防死循环烧 token）。
 
 ## 4. bash 工具（决策 16）
@@ -112,6 +112,7 @@ permission: {
 ## 6. 工具结果回填
 
 - 工具输出按 `ToolOutput { output, title, metadata, attachments }` 结构化。
+- 富输出（`RichToolOutput`，tools/rich-output.ts）：`images`/`files` 追加为独立可见 part；`markdown` 追加为 `synthetic: true` 的 text part（仅展示、不进请求——`buildRequestMessages`/自动标题/用量估算三处过滤，防止与 tool-call 参数双份入上下文）；模型一律只收 `text` 短文本。
 - 文本输出直接作为 tool-result part；图片附件经压缩后按 data URL / 文件引用回填。
 - 下一轮请求时，assistant 消息的 tool-call + tool-result parts 转回 `tool_calls` 与 `role:tool` 消息（DeepSeek 需同时回传 `reasoning_content`，见 llm-engine.md §4.2）。
-- 工具报错 → `result.type:'error'`，模型下一轮可见错误描述（允许自纠）。
+- 工具报错 → `result.type:'error'`，模型下一轮可见错误描述（允许自纠；plan-exit 等哨兵拒绝除外——直接终止本轮）。

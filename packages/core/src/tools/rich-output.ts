@@ -11,6 +11,13 @@ export interface RichToolFile {
   kind?: string;
 }
 
+export interface RichToolMarkdown {
+  /** 消息流中的展示标题（可空，仅正文渲染） */
+  title?: string;
+  /** Markdown 全文（追加为可见 text part；模型只收外层 text） */
+  text: string;
+}
+
 export interface RichToolOutput {
   /** 给模型的文本（tool-result 的 output） */
   text: string;
@@ -18,6 +25,8 @@ export interface RichToolOutput {
   images?: RichToolImage[];
   /** 追加到消息流的文件 chip */
   files?: RichToolFile[];
+  /** 追加到消息流的可见 Markdown 文档（如 plan 工具提交的计划；不回传模型） */
+  markdown?: RichToolMarkdown;
 }
 
 const MARKER = '__rich_tool_output__';

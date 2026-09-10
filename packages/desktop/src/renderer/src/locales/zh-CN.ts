@@ -67,6 +67,7 @@ export default {
     planReadyHint: '是否切换到 Build 模式，按计划开始执行？',
     planSwitch: '切换到 Build 执行',
     planLater: '暂不执行',
+    planPreview: '计划预览',
     loadingHistory: '正在加载历史…',
     toolRunning: '执行中',
     toolCompleted: '已完成',

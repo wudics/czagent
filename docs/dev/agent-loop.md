@@ -49,7 +49,7 @@ async function runLoop(session, agent):
   - 执行前权限断言（`ctx.ask` / permission service，见 tools-and-permissions.md）
   - doom-loop 检测：同一工具同一参数连续 3 次 → 询问用户（参考 processor.ts:356-379）
   - 结果经 `ToolOutput` 规范化（输出上限、图片附件压缩）→ 发布 `tool-result` 事件
-- **权限拒绝 → 停止循环**（决策 18 的配套行为）：`DeclinedError` → 剩余未结算工具标记失败，中断本 loop。
+- **权限拒绝 → 停止循环**（决策 18 配套，对齐 opencode 默认）：权限层 deny 或工具内部 `ctx.ask` 拒绝（`UserRejectedError`，tools/types.ts）→ `denyStopReason` 记录 → 本轮工具结算完即 break，不再发起下一次请求；循环外加一条用户可见收尾提示（"本轮到此停止"，仿 max-steps 收尾）。`general.continueLoopOnDeny = true` 可恢复旧的"错误反馈给模型继续跑"行为。子代理循环内拒绝行为不变（结果作为报告返回主会话）。
 - **错误处理**：LLMError 分类（认证/配额/限流/context-overflow/未知）挂到 assistant 消息并停止或按策略重试；`context-overflow` → 触发压缩重跑（见 §5）。
 
 ## 3. System Prompt 组成
@@ -90,7 +90,7 @@ system = [
 |---|---|
 | 正常完成 | 上轮 finish 非 tool-calls 且无遗留工具 → break |
 | 达到 maxSteps | `agent.steps`（默认 Infinity）→ 最后一轮禁用工具（`toolChoice=none`）并追加 MAX_STEPS_PROMPT 要求"只总结已完成/未完成，不再调工具" |
-| 权限拒绝 | 中断循环（failUnsettledTools + halt） |
+| 权限拒绝 | 中断循环（denyStopReason → break + 收尾提示；`continueLoopOnDeny=true` 则错误反馈继续） |
 | 用户 stop | IPC `session:stop` → AbortController 中断 stream + 中断工具 |
 | provider 错误 | 分类处理，挂错误消息，停止 |
 

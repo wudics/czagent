@@ -117,14 +117,19 @@ export interface AgentProvider {
 
 ```
 SessionEvent = 
-  | { sessionId, type: 'message.part.delta', messageId, partId, part }   // 流式增量
-  | { sessionId, type: 'message.part.done',  messageId, partId, part }   // part 完成
-  | { sessionId, type: 'message.complete',   messageId, message }        // 消息完成
-  | { sessionId, type: 'session.status',     status, runId }             // running/queued/idle
-  | { sessionId, type: 'session.usage',      usage }                     // token/cost 更新（逐轮 LLM 请求后推送的会话累计值）
-  | { sessionId, type: 'session.context',    usage }                     // 本次请求用量（≈当前上下文规模），占用条逐轮实时刷新
-  | { sessionId, type: 'permission.request', request, resolve }          // 权限弹窗
-  | { sessionId, type: 'session.updated',    meta }                      // 标题/状态变更
+  | { sessionId, type: 'message.part.delta', messageId, partIndex, part }  // 流式增量
+  | { sessionId, type: 'message.part.done',  messageId, partIndex, part }  // part 完成
+  | { sessionId, type: 'message.complete',   messageId, message }          // 消息完成
+  | { sessionId, type: 'session.status',     status }                      // running/queued/idle
+  | { sessionId, type: 'session.usage',      usage }                       // token/cost 更新（逐轮 LLM 请求后推送的会话累计值）
+  | { sessionId, type: 'session.context',    used, limit }                 // 下一次请求规模+模型窗口（主进程权威口径），占用条实时刷新
+  | { sessionId, type: 'permission.request', request }                     // 权限弹窗（resolve 走 invoke）
+  | { sessionId, type: 'session.question',   request }                     // question 工具提问
+  | { sessionId, type: 'session.todo',       todos }                       // todo 清单变更
+  | { sessionId, type: 'session.compacted',  message }                     // 压缩 checkpoint 落库（渲染层按 id 归位占位块）
+  | { sessionId, type: 'session.compacting', active, messageId? }          // 压缩进行中/结束（messageId=流式占位块 id，跨会话追踪）
+  | { sessionId, type: 'session.retry', attempt, maxAttempts, delayMs, message }  // 循环级重试等待（UI 显示重试条）
+  | { sessionId, type: 'session.updated',    meta }                        // 标题/状态变更
 ```
 
 > 借鉴 opencode：主循环把 LLM 输出归一化为统一事件流，增量持久化到 sqlite；IPC 层把它推给渲染层，渲染层只消费 `SessionEvent`，二者共享同一套 part 结构。

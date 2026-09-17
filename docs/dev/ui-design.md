@@ -31,22 +31,26 @@
 
 ## 3. 虚拟滚动 + 自动滚动（决策 14）
 
-- **@tanstack/react-virtual**：动态高度测量（markdown 渲染后高度变化大），窗口只挂载可见项 + 上下 buffer（如 8 项）。
-- **反向分页**：维护已加载消息数组，顶部到达 → 加载上一页并 `scrollToIndex(加载前首条)`。
+- **@tanstack/react-virtual**：动态高度测量（markdown 渲染后高度变化大），窗口只挂载可见项 + overscan 10。
+- **反向分页**（ChatArea + chat store）：
+  - **上拉预载**：触发条件 `首个可见概念索引 − droppedCount ≤ 4`（按距占位区边界的真实消息数计算，非概念索引——否则下拉销毁产生的占位区要一路滚穿才触发）。
+  - **下拉销毁（内存窗口）**：只删渲染窗口（含 overscan 缓冲 12）之外的最旧消息，可见内容永不被销毁；删除前按 `measurementsCache` 实测高度累加 `(实测 − 96 估算)` 差值并同步回退 scrollTop——**视口零跳动**；被删区滚上去显示"正在加载历史…"占位，靠近即自动重载（无缝衔接）。
+  - `loadMoreTop` 函数式更新（消除与销毁的快照竞态）；加载后按 `lastTopShift` 位移锚定滚动位置。
 - **自动滚动**：
-  - 新消息/流式输出时，若距容器底部 < 阈值（150px）→ 自动跟随滚动。
-  - 用户向上滚离阈值 → **暂停自动滚动**（判定为查看历史）。
-  - 用户向下滚回阈值内 / 点击"一键到底" → **恢复自动滚动**。
-- 实现：监听 `scrollTop/scrollHeight` 变化 + `isNearBottom()` 布尔，渲染侧用 effect 控制。
+  - 新消息/流式输出时，若用户处于跟随态（钉底）→ 自动跟随。
+  - 向上滚轮/触屏手势立即解钉（意图判钉，不依赖位置阈值——流式拉底会清零距离造成拉锯竞态）；进入会话有强制钉底阶段（轮询至高度稳定）。
+  - 点击"一键到底"恢复跟随。
 
 ## 4. 消息渲染（决策 22 + 决策 15）
 
-- **markdown**：react-markdown + remark-gfm + 代码高亮（shiki/highlight.js）+ 表格 + 折叠代码块；渲染放 **Web Worker**（输入原始 markdown → 输出 HTML），主线程 memo 缓存，避免长文档卡顿。
+- **markdown（Web Worker 管线）**：`marked`（gfm+breaks）在 Worker 内解析，**块级增量渲染**——`marked.lexer` 切顶层块逐块解析，块源串哈希为键 LRU 缓存（800 块），流式期间已完成前缀块全命中、只重解析尾部块（整条流成本 O(尾部块) 而非 O(全文)）；文本级缓存（useMarkdown，300 条真 LRU）+ 60ms 防抖合并高频更新。**DOMPurify 消毒**在主线程响应处做一次并缓存（USE_PROFILES html，禁 style/script/iframe/form 等）；解析失败回退转义纯文本，杜绝 HTML 注入。>10k 字符降级有界纯文本块（LongText 折叠展开）。
 - **reasoning 内联**（决策 15）：`reasoning` part 与正文**同一消息内连续渲染**，视觉区分（灰调 + 斜体 + 淡背景 + "思考中"占位），不折叠、不拆成独立消息；流式时思考先出、正文随后自然衔接。
-- **工具卡片**：tool-call part 渲染为卡片（工具名 + 参数摘要 + 展开/收起），下方承接 tool-result（输出摘要 / 错误红框 / 附件缩略）。状态：pending → running（spinner）→ completed/error。
-- **附件**：文件引用 part 显示文件名/类型/大小，点击打开。
-- **压缩 checkpoint**：`compaction` part 以折叠样式显示"历史已压缩摘要"，可展开。
-- **权限请求**：弹窗卡片（工具、参数、目标路径、三选一按钮）。
+- **工具卡片**：tool-call part 渲染为卡片（工具名 + 标题 + 参数折叠），下方承接 tool-result。状态机 **pending → running → completed/error**：pending=流式中参数未齐（`tool-call-start` 即建卡，模型一开始发工具调用就立即可见）；running=参数齐/执行中（spinner）；`reportProgress` 可实时更新卡片标题。
+- **附件/富输出**：文件引用 part 显示文件名/类型，点击在资源管理器中显示；生成的图片/视频/音频内联渲染。
+- **压缩 checkpoint**：`compaction` part（user 角色系统消息，全宽渲染不走气泡）：压缩中为"正在生成摘要…"spinner + **流式摘要自动展开实时可见**；完成后原地变"历史已压缩 · 点击展开摘要"折叠条（显示位置=压缩完成时刻，随新对话自然上移）。
+- **状态条 StatusBanner**（聊天区底部浮动，仅瞬态出现）：循环级重试等待（原因 + 第 x/N 次）；运行中自动压缩提示。
+- **权限请求**：弹窗卡片（工具、参数、目标路径、三选一按钮）；plan-exit 内嵌计划预览。
+- **跨会话压缩追踪**：`compactingBySession` 注册表在事件守卫前更新，切换会话不丢压缩状态；切回时按占位块 id 重建继续流式（错过的 delta 携带全量累积文本自动追上）。
 
 ## 5. 输入框
 

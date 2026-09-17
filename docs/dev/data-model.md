@@ -110,15 +110,18 @@ interface Settings {
 
 ```ts
 type MessagePart =
-  | { type: 'text'; text: string }                                  // 正文，流式追加
+  | { type: 'text'; text: string; synthetic?: boolean }             // 正文，流式追加；synthetic=仅展示不进请求（如 plan 可见全文）
   | { type: 'reasoning'; text: string }                             // 思考内容（决策 15：内联，非独立消息）
+  | { type: 'image'; dataUrl: string; name?: string }               // 富输出/附件图片
   | { type: 'tool-call'; tool: string; callID: string;
       input: unknown; state: 'pending'|'running'|'completed'|'error'; title?: string }
+  //   pending=流式中参数未齐（tool-call-start 即建卡，不等整条流结束）
   | { type: 'tool-result'; callID: string; output: unknown;
-      state: 'completed'|'error'; metadata?: {...}; attachments?: string[] }
-  | { type: 'file'; path: string; name: string; kind: string }      // 附件引用（大文件/PDF）
-  | { type: 'compaction'; summary: string }                         // 压缩 checkpoint 占位
-  | { type: 'script'; source: string; output: string }              // (P2) 编排脚本
+      state: 'completed'|'error'; error?: string }
+  | { type: 'error'; message: string }                              // LLM 错误/压缩失败等可见错误
+  | { type: 'file'; path: string; name: string; kind: string }      // 附件引用（大文件/PDF/生成文件）
+  | { type: 'compaction'; summary: string; coversBefore?: number }  // 压缩 checkpoint；
+  //   coversBefore=语义边界（摘要覆盖到该时间戳为止），显示位置 createdAt=压缩完成时刻（时间线底部）
 ```
 
 ## 4. 会话状态机
@@ -137,8 +140,8 @@ queued ──(取到并发名额)──► running ──(收到新消息)──
 
 ## 5. 持久化策略
 
-- **增量写**：流式每收到一个 part delta/end，直接 UPDATE messages.parts（同一条消息多次更新，用 `created_at` 与内存缓存去抖）。崩溃后窗口重开从 DB 恢复最新 parts。
-- **压缩标记**：压缩后的旧段标记 `compacted` 或在 messages 上置 `filtered=1`，加载历史时跳过（决策 11，参考 opencode `filterCompactedEffect`）。
+- **增量写 + 节流**：流式 delta 只发事件，`updateMessageParts` 以 200ms 节流落库（同一条消息多次更新）；结束时 `finalizeMessage` 全量兜底。崩溃后窗口重开从 DB 恢复（最多丢最后 200ms 的半截文本）。
+- **压缩**：DB 非破坏（旧消息全量保留），checkpoint 为 user 角色消息追加落库；请求窗口按 checkpoint 的 `coversBefore` 语义边界跳过旧段（见 agent-loop.md §5.4）。
 - **清理**：会话删除级联删 messages/usage/attachments；附件 temp 文件在会话清理/退出时删除。
 
 ## 6. 反向分页（配合虚拟滚动，决策 14）

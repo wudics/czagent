@@ -73,13 +73,13 @@ export function ReasoningView({ text }: { text: string }) {
   );
 }
 
-function ToolStatusBadge({ state }: { state: 'running' | 'completed' | 'error' }) {
+function ToolStatusBadge({ state }: { state: 'pending' | 'running' | 'completed' | 'error' }) {
   const { t } = useTranslation();
-  if (state === 'running') {
+  if (state === 'pending' || state === 'running') {
     return (
       <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
         <span className="h-2 w-2 animate-spin rounded-full border border-current border-t-transparent" />
-        {t('chat.toolRunning')}
+        {t(state === 'pending' ? 'chat.toolPending' : 'chat.toolRunning')}
       </span>
     );
   }
@@ -132,17 +132,27 @@ export function ToolResultView({ part }: { part: Extract<MessagePart, { type: 't
   );
 }
 
-export function CompactionView({ summary }: { summary: string }) {
+export function CompactionView({ summary, streaming }: { summary: string; streaming?: boolean }) {
   const { t } = useTranslation();
+  // 流式占位阶段：摘要未到/为空 → 显示"正在生成摘要"spinner；摘要到达后自动展开实时显示
+  if (!summary.trim()) {
+    return (
+      <div className="flex items-center gap-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        <span className="h-2 w-2 animate-spin rounded-full border border-current border-t-transparent" />
+        {t('chat.compactingSummary')}
+      </div>
+    );
+  }
+  // streaming 时强制展开（摘要边生成边可见）；完成后回落为默认折叠，用户可手动展开
   return (
-    <details className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+    <details className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground" open={streaming || undefined}>
       <summary className="cursor-pointer font-medium">历史已压缩 · 点击展开摘要</summary>
       <div className="mt-1 whitespace-pre-wrap wrap-anywhere leading-relaxed">{summary}</div>
     </details>
   );
 }
 
-export function MessagePartView({ part }: { part: MessagePart }) {
+export function MessagePartView({ part, compacting }: { part: MessagePart; compacting?: boolean }) {
   switch (part.type) {
     case 'text':
       return part.text.length > LONG_TEXT_THRESHOLD ? (
@@ -173,7 +183,7 @@ export function MessagePartView({ part }: { part: MessagePart }) {
         </div>
       );
     case 'compaction':
-      return <CompactionView summary={part.summary} />;
+      return <CompactionView summary={part.summary} streaming={compacting} />;
     case 'file':
       if (part.kind === 'video' || part.kind === 'audio') {
         // 生成的视频/音频内联播放（czagent-file:// 协议由主进程映射本地文件）；不可播放时回退文件 chip

@@ -65,11 +65,18 @@ export function estimateRequestTokens(messages: EstimatedChatMessage[]): number 
   return t;
 }
 
-/** 工具输出截断：保留头部，超限加标记（仅请求侧，DB 仍存全量）；豁免工具用宽松安全上限 */
-export function truncateToolOutput(text: string, tool?: string): string {
-  const cap = tool && FULL_RESULT_TOOLS.has(tool) ? FULL_RESULT_MAX_CHARS : TOOL_RESULT_TRUNCATE_CHARS;
+/** 工具输出截断：保留头部，超限加标记（仅请求侧，DB 仍存全量）；豁免工具用宽松安全上限；
+ * capOverride > 0 时强制使用该上限（如摘要请求把工具输出压到 2k） */
+export function truncateToolOutput(text: string, tool?: string, capOverride?: number): string {
+  const cap = capOverride && capOverride > 0 ? capOverride : tool && FULL_RESULT_TOOLS.has(tool) ? FULL_RESULT_MAX_CHARS : TOOL_RESULT_TRUNCATE_CHARS;
   if (text.length <= cap) return text;
   return text.slice(0, cap) + TOOL_RESULT_TRUNCATE_MARKER;
+}
+
+/** 工具 schema 数组的 token 估算（随请求发送、参与计费与窗口占用，但不含在消息估算里） */
+export function estimateToolsTokens(tools: unknown): number {
+  if (!Array.isArray(tools) || tools.length === 0) return 0;
+  return Math.ceil(JSON.stringify(tools).length / 4) + tools.length * MESSAGE_OVERHEAD_TOKENS;
 }
 
 /** provider usage 折算为"上次请求的上下文规模"（对齐 opencode 口径：input+output+cache 全加） */

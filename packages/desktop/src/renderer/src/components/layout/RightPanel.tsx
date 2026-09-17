@@ -34,7 +34,8 @@ export function RightPanel() {
   const usage = useChatStore((s) => s.usage);
   const context = useChatStore((s) => s.context);
   const replying = useChatStore((s) => s.replying);
-  const compacting = useChatStore((s) => s.compacting);
+  // 压缩状态来自跨会话注册表（切换会话回来仍能看到"压缩中"）
+  const compacting = useChatStore((s) => (activeId ? !!s.compactingBySession[activeId] : false));
   const compact = useChatStore((s) => s.compact);
   const todos = useTodosStore((s) => (activeId ? s.bySession[activeId] : undefined)) ?? [];
 

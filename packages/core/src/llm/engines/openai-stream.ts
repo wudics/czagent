@@ -12,6 +12,11 @@ import { fetchJsonWithRetry } from './http.js';
 
 export const OPENAI_CHAT_PATH = '/chat/completions';
 
+/** 规范化工具名：去首尾空白、剥 functions. 前缀与 :N 后缀（部分平台的命名修饰会导致"未知工具"误判） */
+export function normalizeToolName(name: string): string {
+  return name.trim().replace(/^functions\./, '').replace(/:\d+$/, '');
+}
+
 export interface OpenAiChatOptions {
   /** 流式 delta 中承载思考内容的字段（默认 reasoning_content） */
   reasoningField?: string;
@@ -84,6 +89,33 @@ export async function* consumeOpenAiStream(res: Response, signal: AbortSignal | 
   let callSeq = 0;
   try {
     const pendingTools = new Map<number, { callID: string; tool: string; input: string; announced: boolean }>();
+    // flush 已聚合的工具调用 → tool-call 事件（任意 finish 路径共用）
+    const flushPendingTools = function* (): Generator<LLMEvent> {
+      for (const t of pendingTools.values()) {
+        const name = normalizeToolName(t.tool);
+        const raw = t.input.trim();
+        // 空工具名 或 参数非合法 JSON → 仍产出 tool-call（带 parseError 标记），由调用方
+        // 合成错误结果回传模型自我纠正；不再降级为文本导致调用被丢弃、turn 无声终止
+        if (!name) {
+          const callID = t.callID || `call-${++callSeq}`;
+          yield { type: 'tool-call', callID, tool: '', input: raw, parseError: raw ? 'empty tool name' : 'empty tool name and arguments' };
+          continue;
+        }
+        let input: unknown = {};
+        let parseError: string | undefined;
+        if (raw) {
+          try {
+            input = JSON.parse(raw) as unknown;
+          } catch (e) {
+            input = raw;
+            parseError = String((e as Error)?.message ?? e);
+          }
+        }
+        // 部分平台（如 siliconflow 托管模型）可能缺 tool_call id，补一个保证 call/result 配对
+        const callID = t.callID || `call-${++callSeq}`;
+        yield { type: 'tool-call', callID, tool: name, input, ...(parseError ? { parseError } : {}) };
+      }
+    };
     for await (const data of parseSse(res.body, signal)) {
       let chunk: Record<string, any>;
       try {
@@ -106,41 +138,25 @@ export async function* consumeOpenAiStream(res: Response, signal: AbortSignal | 
             const cur = pendingTools.get(idx) ?? { callID: '', tool: '', input: '', announced: false };
             if (tc.id) cur.callID = tc.id;
             if (tc.function?.name) cur.tool = tc.function.name;
+            // id+name 均已知（可分块后到）才宣告 start：调用方流中即建 pending 卡片；
+            // 任一缺失不宣告（callID 是调用方 upsert/去重键，避免空键/空名产生残缺卡片）
+            const ready = cur.callID !== '' && cur.tool.trim() !== '';
+            if (ready && !cur.announced) {
+              cur.announced = true;
+              yield { type: 'tool-call-start', callID: cur.callID, tool: normalizeToolName(cur.tool) };
+            }
             if (tc.function?.arguments) {
-              if (!cur.announced) {
-                cur.announced = true;
-                yield { type: 'tool-call-start', callID: cur.callID, tool: cur.tool };
-              }
               cur.input += tc.function.arguments;
-              yield { type: 'tool-call-delta', callID: cur.callID, text: tc.function.arguments };
+              if (ready) yield { type: 'tool-call-delta', callID: cur.callID, text: tc.function.arguments };
             }
             pendingTools.set(idx, cur);
           }
         }
         if (choice.finish_reason) {
-          if (choice.finish_reason === 'tool_calls') {
-            for (const t of pendingTools.values()) {
-              const name = t.tool.trim();
-              const raw = t.input.trim();
-              // 空工具名 或 参数非合法 JSON → 视为模型误发工具调用（内容按文本输出，避免卡死/误执行）
-              if (!name) {
-                if (raw) yield { type: 'text-delta', text: raw };
-                continue;
-              }
-              let input: unknown = {};
-              if (raw) {
-                try {
-                  input = JSON.parse(raw) as unknown;
-                } catch {
-                  yield { type: 'text-delta', text: raw };
-                  continue;
-                }
-              }
-              // 部分平台（如 siliconflow 托管模型）可能缺 tool_call id，补一个保证 call/result 配对
-              const callID = t.callID || `call-${++callSeq}`;
-              yield { type: 'tool-call', callID, tool: name, input };
-            }
-          }
+          // 任意 finish_reason 都 flush 已聚合的工具调用：部分 OpenAI 兼容平台（GLM/Qwen 部署）
+          // 在流出 tool_calls 增量后回 finish_reason=stop，只认 tool_calls 会把调用静默丢弃，
+          // 导致 loop 误以为无工具可执行而终止（对齐 opencode：stop+有工具调用也要继续）
+          yield* flushPendingTools();
           yield {
             type: 'finish',
             finishReason: choice.finish_reason,
@@ -152,6 +168,8 @@ export async function* consumeOpenAiStream(res: Response, signal: AbortSignal | 
           return;
         }
       } else if (chunk?.usage) {
+        // 无 choices 的纯 usage 终帧：同样 flush（部分平台以此收尾且此前无 finish_reason）
+        yield* flushPendingTools();
         yield { type: 'finish', finishReason: 'stop', usage: normalizeUsage(chunk.usage) };
         cancelBody();
         return;

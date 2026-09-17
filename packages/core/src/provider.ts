@@ -65,12 +65,19 @@ export type MessagePart =
       tool: string;
       callID: string;
       input: unknown;
-      state: 'running' | 'completed' | 'error';
+      /** pending=流式中参数未齐（立即出卡）；running=参数齐/执行中 */
+      state: 'pending' | 'running' | 'completed' | 'error';
       title?: string;
     }
   | { type: 'tool-result'; callID: string; output: unknown; state: 'completed' | 'error'; error?: string }
   | { type: 'error'; message: string }
-  | { type: 'compaction'; summary: string }
+  | {
+      type: 'compaction';
+      summary: string;
+      /** 语义边界：此摘要覆盖到该时间戳为止（该时刻之后的原文仍进请求窗口）。
+       * 缺省（旧格式 checkpoint）= 按消息定位切窗；显示位置 createdAt = 压缩完成时刻（时间线底部） */
+      coversBefore?: number;
+    }
   | { type: 'file'; name: string; kind: string; path: string };
 
 export interface ChatMessage {
@@ -135,6 +142,11 @@ export type SessionEvent =
   | { sessionId: string; type: 'session.question'; request: QuestionRequest }
   | { sessionId: string; type: 'session.todo'; todos: TodoItem[] }
   | { sessionId: string; type: 'session.compacted'; message: ChatMessage }
+  /** 压缩进行中（自动/手动共用信号；摘要是一次 LLM 调用，需数秒）。
+   * messageId = 流式占位块/最终 checkpoint 的消息 id（渲染层跨会话追踪与失败清理用） */
+  | { sessionId: string; type: 'session.compacting'; active: boolean; messageId?: string }
+  /** 循环级重试：可重试错误（429/网络/5xx）退避后重发本轮请求 */
+  | { sessionId: string; type: 'session.retry'; attempt: number; maxAttempts: number; delayMs: number; message: string }
   /** 上下文仪表：下一次请求的规模（max(请求估算, 上次真实 usage)）+ 模型窗口；主进程权威口径 */
   | { sessionId: string; type: 'session.context'; used: number; limit: number }
   | { sessionId: string; type: 'session.updated'; meta: SessionMeta };
@@ -340,6 +352,8 @@ export interface GeneralSettings {
     auto: boolean;
     reservedTokens: number;
     preserveRatio: number;
+    /** 摘要专用模型 id（留空=用会话当前模型；可选便宜快速的模型降低压缩成本） */
+    modelId?: string;
   };
   /** 全局关闭的技能名列表（I13，存设置而非技能文件；跨层同名技能一并隐藏） */
   disabledSkills?: string[];

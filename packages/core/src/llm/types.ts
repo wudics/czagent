@@ -19,7 +19,7 @@ export type LLMEvent =
   | { type: 'text-delta'; text: string }
   | { type: 'tool-call-start'; callID: string; tool: string }
   | { type: 'tool-call-delta'; callID: string; text: string }
-  | { type: 'tool-call'; callID: string; tool: string; input: unknown }
+  | { type: 'tool-call'; callID: string; tool: string; input: unknown; /** 参数非法 JSON 时携带原始串（input=原始文本），由调用方合成错误结果 */ parseError?: string }
   | { type: 'finish'; finishReason: string; usage?: Usage }
   | { type: 'error'; error: LLMError };
 

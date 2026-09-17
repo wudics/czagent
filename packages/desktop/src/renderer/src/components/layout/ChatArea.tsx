@@ -6,10 +6,18 @@ import { useSessionsStore } from '../../stores/sessions';
 import { useChatStore } from '../../stores/chat';
 import { MessageItem } from '../chat/MessageItem';
 import { ScrollBottomButton } from '../chat/ScrollBottomButton';
+import { StatusBanner } from '../chat/StatusBanner';
 import { PermissionCard } from '../chat/PermissionCard';
 import { QuestionCard } from '../chat/QuestionCard';
+import { chatLoadConfig } from '../../stores/chat';
 
 const NEAR_BOTTOM_PX = 150;
+/** 占位块/未测量项的高度估算（与虚拟列表 estimateSize 一致） */
+const ESTIMATED_ITEM_SIZE = 96;
+/** 触发上拉预载的概念距离（距占位区边界/列表顶 4 项内） */
+const LOAD_AHEAD_ITEMS = 4;
+/** 下拉销毁的安全缓冲（渲染窗口 overscan 10 + 余量），被删区必须完全在其之外 */
+const DROP_SAFE_BUFFER = 12;
 
 export function ChatArea() {
   const { t } = useTranslation();
@@ -35,7 +43,7 @@ export function ChatArea() {
   const virtualizer = useVirtualizer({
     count,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => 96,
+    estimateSize: () => ESTIMATED_ITEM_SIZE,
     overscan: 10,
     getItemKey: (index) => {
       if (index < droppedCount) return `drop:${index}`;
@@ -127,11 +135,12 @@ export function ChatArea() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId, hasMessages]);
 
-  // 滚动到顶部附近 → 加载上一页
+  // 滚动到占位区/顶部附近 → 预加载上一页（按"距占位区边界的真实消息数"计算，
+  // 而非概念索引：否则下拉销毁产生的占位区要一路滚穿才触发，出现大片"正在加载历史…"）
   useEffect(() => {
     const first = items[0];
     if (!first) return;
-    if (first.index <= 4 && (hasMoreTop || droppedCount > 0) && !loadingTop) {
+    if (first.index - droppedCount <= LOAD_AHEAD_ITEMS && (hasMoreTop || droppedCount > 0) && !loadingTop) {
       prevStartRef.current = first.index;
       void loadMoreTop();
     }
@@ -159,7 +168,28 @@ export function ChatArea() {
     if (!near) {
       // 向下滚动远离顶部时释放资源（决策 14：向下滚动释放资源）
       const first = virtualizer.getVirtualItems()[0];
-      if (first && first.index > 12) useChatStore.getState().dropOldest();
+      if (first && first.index > DROP_SAFE_BUFFER) {
+        const st = useChatStore.getState();
+        const { keep } = chatLoadConfig();
+        const excess = st.messages.length - keep;
+        if (excess > 0) {
+          // 只删渲染窗口（含 overscan）之外的最旧消息：可见/即将可见的内容永不被销毁
+          const safe = first.index - DROP_SAFE_BUFFER - st.droppedCount;
+          const drop = Math.min(excess, safe);
+          if (drop > 0) {
+            // 补偿被删项的"实测高 − 占位估算"差值：删除后其余项的上移量恰等于该差值，
+            // 同步回退 scrollTop 保持视口纹丝不动（否则会瞬间跳过被删区域的内容）
+            let delta = 0;
+            for (let i = 0; i < drop; i++) {
+              const msg = st.messages[i];
+              const measured = msg ? virtualizer.measurementsCache[st.droppedCount + i] : undefined;
+              if (measured && measured.key === msg!.id) delta += measured.size - ESTIMATED_ITEM_SIZE;
+            }
+            st.dropOldest(drop);
+            el.scrollTop = Math.max(0, el.scrollTop - delta);
+          }
+        }
+      }
     }
   };
 
@@ -236,6 +266,7 @@ export function ChatArea() {
       </div>
 
       {!following && <ScrollBottomButton onClick={jumpToBottom} />}
+      <StatusBanner />
       <PermissionCard />
       <QuestionCard />
     </div>

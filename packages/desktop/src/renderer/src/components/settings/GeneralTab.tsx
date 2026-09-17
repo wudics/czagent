@@ -1,4 +1,6 @@
+import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import { implMetaOf } from '@czagent/core';
 import { useSettingsStore } from '../../stores/settings';
 import { Select } from '../ui/select';
 import { Switch } from '../ui/switch';
@@ -7,7 +9,10 @@ import { Field, NumInput, Section } from './fields';
 export function GeneralTab() {
   const { t } = useTranslation();
   const general = useSettingsStore((s) => s.settings.general);
+  const chatModels = useSettingsStore((s) => s.settings.chatModels);
   const updateGeneral = useSettingsStore((s) => s.updateGeneral);
+  // 摘要模型候选：启用的对话模型（留空 = 跟随会话当前模型）
+  const summaryModels = useMemo(() => chatModels.filter((m) => m.enabled), [chatModels]);
 
   return (
     <div className="space-y-6">
@@ -97,6 +102,19 @@ export function GeneralTab() {
               />
             </Field>
           </div>
+          <Field label={t('settings.general.summaryModel')} hint={t('settings.general.summaryModelHint')}>
+            <Select
+              value={general.compaction.modelId ?? ''}
+              onChange={(e) => void updateGeneral({ compaction: { ...general.compaction, modelId: e.target.value || undefined } })}
+            >
+              <option value="">{t('settings.general.summaryModelSession')}</option>
+              {summaryModels.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.displayName}（{implMetaOf(m.implId)?.name ?? m.implId}）
+                </option>
+              ))}
+            </Select>
+          </Field>
         </div>
       </Section>
     </div>

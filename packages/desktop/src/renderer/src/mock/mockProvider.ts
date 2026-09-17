@@ -361,12 +361,14 @@ export class MockProvider implements AgentProvider {
         {
           type: 'compaction',
           summary: `（演示）已将较早的 ${page.messages.length - 1} 条历史折叠为摘要：此前的讨论围绕「${session.title}」展开，关键结论、文件路径与未完成事项均已保留。`,
+          // 与真实实现一致：显示在完成时刻（时间线底部原地保留），语义边界供窗口构建使用
+          coversBefore: last.createdAt - 1,
         },
       ],
-      createdAt: Math.max(0, last.createdAt - 1),
+      createdAt: Date.now(),
     };
     const extras = this.extras.get(sessionId);
-    if (extras && extras.length > 0) extras.splice(extras.length - 1, 0, checkpoint);
+    if (extras) extras.push(checkpoint);
     else this.extras.set(sessionId, [checkpoint]);
     this.emitter.emit({ sessionId, type: 'session.compacted', message: checkpoint });
     // 模拟压缩后回落：尾部保留（~15k 上限）+ 摘要

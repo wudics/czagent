@@ -1,6 +1,7 @@
 import { memo } from 'react';
 import type { ChatMessage } from '@czagent/core';
 import { useSessionsStore } from '../../stores/sessions';
+import { useChatStore } from '../../stores/chat';
 import { cn } from '../../lib/utils';
 import { MessagePartView } from './MessagePartView';
 
@@ -17,6 +18,18 @@ function MessageItemInner({ message }: { message: ChatMessage }) {
   // 脚本会话：user 消息即脚本源码，按代码样式渲染（等宽，不跑 markdown）
   const isScript = useSessionsStore((s) => s.sessions.find((x) => x.id === s.activeId)?.mode === 'script');
   const isScriptUser = isUser && isScript;
+  // 该消息是否为"压缩进行中"的流式占位块/checkpoint（摘要自动展开显示）
+  const compacting = useChatStore((s) => s.compactingBySession[message.sessionId] === message.id);
+
+  // 压缩 checkpoint/流式占位块（仅含 compaction part，user 或 assistant 角色均可能——
+  // 活跃 delta 先到时 upsertPartIn 建的是 assistant 占位）：不走气泡，统一全宽渲染折叠条
+  if (message.parts.length > 0 && message.parts.every((p) => p.type === 'compaction')) {
+    return (
+      <div className="flex flex-col gap-2 py-2">
+        {message.parts.map((p, i) => (p ? <MessagePartView key={i} part={p} compacting={compacting} /> : null))}
+      </div>
+    );
+  }
 
   return (
     <div className={cn('flex gap-3 py-2', isUser && 'flex-row-reverse')}>
@@ -58,7 +71,7 @@ function MessageItemInner({ message }: { message: ChatMessage }) {
         </div>
       ) : (
         <div className="min-w-0 flex-1 space-y-2.5">
-          {message.parts.map((p, i) => (p ? <MessagePartView key={i} part={p} /> : null))}
+          {message.parts.map((p, i) => (p ? <MessagePartView key={i} part={p} compacting={compacting} /> : null))}
         </div>
       )}
     </div>

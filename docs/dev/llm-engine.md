@@ -51,11 +51,14 @@ llm/engines/
 type LLMEvent =
   | { type: 'text-delta'; text }
   | { type: 'reasoning-delta'; text }
-  | { type: 'tool-call-start'; callID; tool } | { type: 'tool-call-delta'; callID; text }
-  | { type: 'tool-call'; callID; tool; input }
+  | { type: 'tool-call-start'; callID; tool }      // id+name 均已知即宣告（调用方流中即建 pending 卡）
+  | { type: 'tool-call-delta'; callID; text }
+  | { type: 'tool-call'; callID; tool; input; parseError? }  // parseError=参数非合法 JSON/空名（input=原始串），调用方合成错误结果回传
   | { type: 'finish'; finishReason; usage? }
   | { type: 'error'; error: LLMError }
 ```
+
+协议层加固（openai-stream.ts）：任意 finish_reason（含无 choices 的纯 usage 终帧）都 flush 已聚合的工具调用（部分平台 stop 携带 tool_calls）；工具名规范化（剥 `functions.` 前缀与 `:N` 后缀）；缺 id 补生成保证 call/result 配对。
 
 （`text/reasoning start/end`、`step-start/finish` 等由会话层在消费引擎事件时派生，引擎只报增量与终点。）
 

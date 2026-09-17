@@ -43,12 +43,16 @@ import type { ScriptAgentRunOptions, ScriptUseOverrides } from '../script/types.
 import { checkPermission, classifyBashCommand, extractTargetPath, pathInside, resolvePath } from '../permission/index.js';
 import { patchFilePaths } from '../tools/patch.js';
 import { attachmentKind, imageToDataUrl, parseAttachmentToText, textToMessagePart } from './attachments.js';
-import { estimateRequestTokens, pruneHistory, selectTailStart, tailBudget, truncateToolOutput, usageTotal } from '../compaction.js';
+import { estimateRequestTokens, estimateToolsTokens, pruneHistory, selectTailStart, tailBudget, truncateToolOutput, usageTotal } from '../compaction.js';
 import { appendTurnReminder, buildTurnReminder } from '../reminders.js';
 import { loadProjectInstructions, renderProjectInstructions, type InstructionsCacheEntry } from '../instructions.js';
 import { composeSystemPrompt, SUB_AGENT_ADDENDUM } from '../settings-defaults.js';
 
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+/** 摘要请求中的工具输出截断上限（摘要只需要要点，10k 全文既慢又挤占预算） */
+const SUMMARY_TOOL_OUTPUT_CHARS = 2_000;
+/** 压缩单飞冲突提示（手动/自动互斥；runLoop 据此静默跳过，不作为错误展示） */
+const COMPACTION_BUSY = '该会话已在压缩中';
 
 let uid = 0;
 function nextId(prefix: string): string {
@@ -139,6 +143,7 @@ function buildRequestMessages(
   env?: string,
   includeImages = true,
   reminder?: string,
+  opts?: { toolOutputMaxChars?: number },
 ): LLMChatMessage[] {
   let out: LLMChatMessage[] = [];
   const systemParts = [
@@ -148,12 +153,12 @@ function buildRequestMessages(
   if (systemParts.length > 0) out.push({ role: 'system', content: systemParts.join('\n\n') });
   for (const m of history) {
     if (m.role === 'user') {
-      // 压缩 checkpoint 消息 → system 摘要
+      // 压缩 checkpoint 消息 → user 角色摘要（不用对话中部 system：部分 OpenAI 兼容后端拒绝非开头 system 消息）
       const compactionParts = m.parts.filter((p): p is Extract<MessagePart, { type: 'compaction' }> => p.type === 'compaction');
       if (compactionParts.length > 0) {
         out.push({
-          role: 'system',
-          content: `以下是此前的对话摘要，请在此上下文基础上继续：\n${compactionParts.map((p) => p.summary).join('\n')}`,
+          role: 'user',
+          content: `以下内容是系统对此前对话的自动摘要（非用户发言），请在此基础上继续对话：\n${compactionParts.map((p) => p.summary).join('\n')}`,
         });
         if (compactionParts.length === m.parts.length) continue;
       }
@@ -205,7 +210,7 @@ function buildRequestMessages(
       );
       out.push({
         role: 'tool',
-        content: result ? truncateToolOutput(toolResultContent(result), cp.tool) : '（该工具调用未执行/已中断）',
+        content: result ? truncateToolOutput(toolResultContent(result), cp.tool, opts?.toolOutputMaxChars) : '（该工具调用未执行/已中断）',
         toolCallId: cp.callID,
       });
     }
@@ -237,6 +242,13 @@ export class SessionManager implements AgentProvider {
   private activeLoops = 0;
   /** 等待槽位的会话队列（sessionId） */
   private readonly queue: string[] = [];
+  /** 进行中的压缩任务（单飞注册表：sessionId → 占位块消息 id + 中止控制器；手动/自动互斥） */
+  private readonly compactingSessions = new Map<string, { messageId: string; controller: AbortController }>();
+  /** 手动压缩并行数（上限复用 maxConcurrency）与 FIFO 等待队列 */
+  private compactionActive = 0;
+  private readonly compactionQueue: Array<() => void> = [];
+  /** 已进入手动压缩流程（含排队等待）的会话：关闭"排队期间重复点击"窗口 */
+  private readonly manualCompactionQueued = new Set<string>();
   /** MCP 客户端注册表（应用级缓存：懒连接/错误隔离） */
   private readonly mcp = new McpRegistry();
   /** LLM 网关：模型解析/校验/路由的唯一入口（无状态，按调用传入 settings） */
@@ -317,6 +329,9 @@ export class SessionManager implements AgentProvider {
   async deleteSession(id: string): Promise<void> {
     this.aborts.get(id)?.abort();
     this.aborts.delete(id);
+    // 中止该会话进行中的压缩（手动/自动统一走单飞注册表）；排队中的任务由槽位复核兜底退出
+    this.compactingSessions.get(id)?.controller.abort();
+    this.compactingSessions.delete(id);
     // 若在并发队列中等待，先出队（后续 pumpQueue 会跳过不存在的会话）
     const qi = this.queue.indexOf(id);
     if (qi >= 0) this.queue.splice(qi, 1);
@@ -387,12 +402,14 @@ export class SessionManager implements AgentProvider {
 
   // ---- 上下文压缩 ----
 
-  /** contextLimit<=0（未知）或 auto=false → 返回 null（不自动压缩）；否则返回可用 token 预算 */
-  private compactionUsable(contextLimit: number, settings: Settings): number | null {
+  /** contextLimit<=0（未知）或 auto=false → 返回 null（不自动压缩）；否则返回可用 token 预算。
+   * 预留 = max(reservedTokens, min(maxOutput, 32k))：输出同样占用窗口（对齐 opencode），避免触发过晚 */
+  private compactionUsable(contextLimit: number, settings: Settings, maxOutput = 0): number | null {
     const cl = contextLimit ?? 0;
     const c = settings.general?.compaction;
     if (cl <= 0 || !c?.auto) return null;
-    const u = cl - c.reservedTokens;
+    const reserved = Math.max(c.reservedTokens, Math.min(maxOutput > 0 ? maxOutput : 0, 32_000));
+    const u = cl - reserved;
     return u > 0 ? u : null;
   }
 
@@ -404,16 +421,33 @@ export class SessionManager implements AgentProvider {
     return -1;
   }
 
-  /** 请求窗口：从最后一个 compaction checkpoint 起（含），无则全量；saturated=窗口被 300 条上限截断（更早历史未进入） */
+  /**
+   * 请求窗口：无 checkpoint → 全量；有 → [checkpoint, ...边界之后原文]。
+   * 新格式 checkpoint（coversBefore）显示在完成时刻（时间线较后），按语义边界构窗：
+   * 摘要 + coversBefore 之后的原文（保留尾部 + 新消息，时间序）进请求，更早历史跳过。
+   * 旧格式（无 coversBefore）回退按消息定位切窗。多个 checkpoint 以最后一个为准
+   * （更早的已被合并进最新摘要，且其 createdAt <= 最新边界，天然被过滤）。
+   * saturated = 窗口内看不到 checkpoint 且页外还有更早消息（>300 条，触发强制压缩）。
+   */
   private historyWindow(sessionId: string): { messages: ChatMessage[]; saturated: boolean } {
     const page = this.opts.db.storage.pageMessages(sessionId, undefined, 300);
     const idx = this.lastCompactionIndex(page.messages);
-    const messages = idx >= 0 ? page.messages.slice(idx) : page.messages;
-    // 仅当"窗口内看不到 checkpoint 且页外还有更早消息"才算饱和——checkpoint 在页内时窗口必然完整
-    return { messages, saturated: idx < 0 && page.hasMore };
+    if (idx < 0) return { messages: page.messages, saturated: page.hasMore };
+    const checkpoint = page.messages[idx]!;
+    const coversBefore = checkpoint.parts.find(
+      (p): p is Extract<MessagePart, { type: 'compaction' }> => p.type === 'compaction' && typeof p.coversBefore === 'number',
+    )?.coversBefore;
+    if (coversBefore !== undefined) {
+      const tail = page.messages.filter((m) => m.id !== checkpoint.id && m.createdAt > coversBefore);
+      return { messages: [checkpoint, ...tail], saturated: false };
+    }
+    return { messages: page.messages.slice(idx), saturated: false };
   }
 
-  /** 摘要压缩：old 区折叠为摘要并写 DB checkpoint（旧消息保留在 DB，仅请求窗口跳过）。溢出判定由 runLoop 完成。返回是否实际插入 checkpoint */
+  /** 摘要压缩：old 区折叠为摘要并写 DB checkpoint（旧消息保留在 DB，仅请求窗口跳过）。
+   * checkpointId 传入时复用为 checkpoint 消息 id（与流式占位块同一 id，渲染层按 id 归位）；
+   * onSummaryDelta 在摘要流式增长时回调（占位块实时显示）。
+   * 返回 compacted=false + error 非空 = 摘要调用失败（调用方决定提示方式）；old 为空 = 无可压缩（无 error） */
   private async maybeCompact(opts: {
     sessionId: string;
     settings: Settings;
@@ -422,8 +456,10 @@ export class SessionManager implements AgentProvider {
     /** 已 prune 的请求窗口 */
     history: ChatMessage[];
     usable: number;
-  }): Promise<boolean> {
-    const { sessionId, settings, target, signal, history, usable } = opts;
+    checkpointId?: string;
+    onSummaryDelta?: (text: string) => void;
+  }): Promise<{ compacted: boolean; error?: string }> {
+    const { sessionId, settings, target, signal, history, usable, checkpointId, onSummaryDelta } = opts;
     // headIdx 跳过已有的摘要 checkpoint；其摘要文本并入新一次 summarize（避免二次压缩丢失旧摘要）
     const headIdx = this.lastCompactionIndex(history) === 0 ? 1 : 0;
     const previousSummary =
@@ -437,63 +473,191 @@ export class SessionManager implements AgentProvider {
     const budget = tailBudget(usable, settings.general.compaction.preserveRatio);
     const tailStart = selectTailStart(history, headIdx, budget);
     const old = history.slice(headIdx, tailStart);
-    if (old.length === 0) return false;
-    const summary = await this.summarize(sessionId, target, old, signal, previousSummary);
-    if (!summary) return false;
+    if (old.length === 0) return { compacted: false };
+    const { summary, error } = await this.summarize(settings, target, old, signal, previousSummary, onSummaryDelta);
+    if (!summary) return { compacted: false, error: error ?? '摘要生成失败' };
 
+    // 会话可能已被删除（删除会话会中止压缩）：落库前复核，避免孤儿 checkpoint
+    if (!this.opts.db.storage.getSession(sessionId)) return { compacted: false, error: '会话已删除' };
     const keep = history.slice(tailStart);
-    // checkpoint 落在 old 与 keep 之间（createdAt 取 keep 最旧一条 -1ms）
-    const createdAt = keep.length > 0 ? keep[0]!.createdAt - 1 : Date.now();
+    // 显示位置 = 压缩完成时刻（时间线底部原地保留，随后随新对话自然上移）；
+    // 语义边界 = 尾部最旧一条之前（coversBefore），historyWindow 据此构窗：摘要进请求 + 尾部原文保留
+    const coversBefore = keep.length > 0 ? keep[0]!.createdAt - 1 : Date.now();
     const checkpoint: ChatMessage = {
-      id: nextId('u'),
+      id: checkpointId ?? nextId('u'),
       sessionId,
       role: 'user',
-      parts: [{ type: 'compaction', summary }],
-      createdAt,
+      parts: [{ type: 'compaction', summary, coversBefore }],
+      createdAt: Date.now(),
     };
     this.opts.db.storage.insertMessage(checkpoint);
-    // 推送 checkpoint：运行中的界面无需重开会话即可看到「历史已压缩」折叠条
+    // 推送 checkpoint：渲染层按同 id 原地替换流式占位块，摘要条保留在时间线底部
     this.emit({ sessionId, type: 'session.compacted', message: checkpoint });
-    return true;
+    return { compacted: true };
   }
 
-  /** 用会话模型把旧消息总结为一段文本；图片剥为占位（不依赖视觉、不发原图），previousSummary 并入合并 */
+  /**
+   * 压缩任务统一执行（手动/自动共用）：单飞注册 → 时间线占位块流式显示摘要 → maybeCompact → 事件清理。
+   * 对齐 opencode：压缩在时间线可见（占位块随摘要流式增长，完成后以同一 id 归位到历史中缝）。
+   * signal 为外部中止信号（如 runLoop 的会话信号；删除会话通过注册表内的 controller 中止）。
+   * 单飞冲突返回 { compacted:false, error: COMPACTION_BUSY }。
+   */
+  private async executeCompaction(opts: {
+    sessionId: string;
+    settings: Settings;
+    target: ResolvedChat;
+    /** 外部中止信号（可缺省；删除会话经由注册表内 controller 中止） */
+    signal?: AbortSignal;
+    /** 已 prune 的请求窗口 */
+    history: ChatMessage[];
+    usable: number;
+  }): Promise<{ compacted: boolean; error?: string }> {
+    const { sessionId, signal: externalSignal } = opts;
+    if (this.compactingSessions.has(sessionId)) return { compacted: false, error: COMPACTION_BUSY };
+    const messageId = nextId('u');
+    const controller = new AbortController();
+    const onExternalAbort = (): void => controller.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) controller.abort();
+      else externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+    this.compactingSessions.set(sessionId, { messageId, controller });
+    // 占位块：空摘要首帧立即出现在时间线底部，随摘要流式增长
+    const emitPlaceholder = (summary: string): void => {
+      this.emit({ sessionId, type: 'message.part.delta', messageId, partIndex: 0, part: { type: 'compaction', summary } });
+    };
+    this.emit({ sessionId, type: 'session.compacting', active: true, messageId });
+    emitPlaceholder('');
+    try {
+      return await this.maybeCompact({
+        sessionId,
+        settings: opts.settings,
+        target: opts.target,
+        signal: controller.signal,
+        history: opts.history,
+        usable: opts.usable,
+        checkpointId: messageId,
+        onSummaryDelta: emitPlaceholder,
+      });
+    } finally {
+      this.compactingSessions.delete(sessionId);
+      if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
+      // 失败时渲染层据 messageId 清理占位块；成功时 session.compacted 已按同 id 归位（幂等）
+      this.emit({ sessionId, type: 'session.compacting', active: false, messageId });
+    }
+  }
+
+  /** 手动压缩排队：并行上限复用 maxConcurrency，FIFO 等待；返回释放槽位的函数 */
+  private async acquireCompactionSlot(): Promise<() => void> {
+    for (;;) {
+      let limit = 4;
+      try {
+        limit = (await this.opts.config.read()).general.maxConcurrency || 4;
+      } catch {
+        // 读取失败按缺省 4
+      }
+      if (this.compactionActive < limit) break;
+      await new Promise<void>((resolve) => this.compactionQueue.push(resolve));
+    }
+    this.compactionActive += 1;
+    return () => {
+      this.compactionActive -= 1;
+      this.compactionQueue.shift()?.();
+    };
+  }
+
+  /**
+   * 用摘要模型（compaction.modelId 可选，缺省会话模型）把旧消息总结为一段文本。
+   * 加固（对齐 opencode）：图片剥占位、工具输出截 2k、请求总预算上限——超限按消息粒度分块
+   * 顺序摘要并用 previousSummary 逐块合并；瞬态错误（限流/网络/服务异常）重试 1 次。
+   */
   private async summarize(
-    sessionId: string,
-    target: ResolvedChat,
+    settings: Settings,
+    fallbackTarget: ResolvedChat,
     history: ChatMessage[],
     signal: AbortSignal,
     previousSummary?: string,
-  ): Promise<string | null> {
-    try {
-      const stripped = history.map((m) => ({
-        ...m,
-        parts: m.parts.flatMap((p) =>
-          p.type === 'image' ? [{ type: 'text' as const, text: `[图片附件: ${p.name ?? '未命名'}]` }] : [p],
-        ),
-      }));
-      const system =
-        '请阅读下面的对话历史，用简洁的中文写一段总结。必须保留：已得出的结论、做出的决定、重要文件/附件的名称与路径、与图片相关的内容、尚未完成的事项。不要编造历史中未出现的信息。' +
-        (previousSummary ? `\n\n此前已有一份摘要如下，请合并其内容并去重：\n${previousSummary}` : '');
-      const request: ChatReq = {
-        messages: [
-          { role: 'system', content: system },
-          ...buildRequestMessages(stripped, undefined, undefined, true),
-        ],
-        thinking: 'off',
-        maxTokens: 2048,
-        signal,
-      };
-      const stream = this.engineFor(target).stream(target.binding, request);
-      let text = '';
-      for await (const ev of stream) {
-        if (ev.type === 'text-delta') text += ev.text;
+    onSummaryDelta?: (text: string) => void,
+  ): Promise<{ summary?: string; error?: string }> {
+    const modelId = settings.general.compaction.modelId;
+    const target = (modelId ? this.gateway.resolveChatOrNull(settings, modelId) : undefined) ?? fallbackTarget;
+    const stripped = history.map((m) => ({
+      ...m,
+      parts: m.parts.flatMap((p) =>
+        p.type === 'image' ? [{ type: 'text' as const, text: `[图片附件: ${p.name ?? '未命名'}]` }] : [p],
+      ),
+    }));
+    // 摘要请求总预算：模型窗口已知 → clamp(窗口 − 4k, 16k, 96k)；未知 → 48k 兜底
+    const windowTokens = target.contextLimit > 0 ? target.contextLimit : 52_000;
+    const budget = Math.min(Math.max(windowTokens - 4_000, 16_000), 96_000);
+    // 消息粒度分块：call/result 同属一条 assistant 消息，按消息切分不会拆散配对
+    const chunks: ChatMessage[][] = [];
+    let cur: ChatMessage[] = [];
+    for (const m of stripped) {
+      cur.push(m);
+      if (cur.length > 1 && estimateRequestTokens(buildRequestMessages(cur, undefined, undefined, true, undefined, { toolOutputMaxChars: SUMMARY_TOOL_OUTPUT_CHARS })) > budget) {
+        chunks.push(cur.slice(0, -1));
+        cur = [m];
       }
-      const trimmed = text.trim();
-      return trimmed ? trimmed : null;
-    } catch {
-      return null;
     }
+    if (cur.length > 0) chunks.push(cur);
+    let merged = previousSummary;
+    for (const chunk of chunks) {
+      const res = await this.summarizeOnce(target, chunk, merged, signal, (partial) => {
+        // 流式回调携带"已合并摘要 + 当前块增量"，多块场景占位块持续增长不回退
+        onSummaryDelta?.((merged ? `${merged}\n\n` : '') + partial);
+      });
+      if (!res.summary) return { error: res.error };
+      merged = res.summary;
+    }
+    return merged ? { summary: merged } : { error: '模型未返回摘要内容' };
+  }
+
+  /** 单次摘要调用（瞬态错误重试 1 次；onDelta 随流式增长回调，重试时从空文本重推） */
+  private async summarizeOnce(
+    target: ResolvedChat,
+    chunk: ChatMessage[],
+    previousSummary: string | undefined,
+    signal: AbortSignal,
+    onDelta?: (text: string) => void,
+  ): Promise<{ summary?: string; error?: string }> {
+    const run = async (): Promise<{ summary?: string; error?: string; retryable?: boolean }> => {
+      try {
+        const system =
+          '请阅读下面的对话历史，用简洁的中文写一段总结。必须保留：已得出的结论、做出的决定、重要文件/附件的名称与路径、与图片相关的内容、尚未完成的事项。不要编造历史中未出现的信息。' +
+          (previousSummary ? `\n\n此前已有一份摘要如下，请合并其内容并去重（保留仍为真的细节、去除过时细节、并入新事实）：\n${previousSummary}` : '') +
+          `\n\n请按以下 Markdown 小节输出（无内容的小节省略）：\n## 任务目标与背景\n## 已完成与关键结论\n## 重要文件与路径\n## 用户偏好与约束\n## 未完成事项与下一步`;
+        const request: ChatReq = {
+          messages: [
+            { role: 'system', content: system },
+            ...buildRequestMessages(chunk, undefined, undefined, true, undefined, { toolOutputMaxChars: SUMMARY_TOOL_OUTPUT_CHARS }),
+          ],
+          thinking: 'off',
+          maxTokens: 2048,
+          signal,
+        };
+        const stream = this.engineFor(target).stream(target.binding, request);
+        let text = '';
+        for await (const ev of stream) {
+          if (ev.type === 'text-delta') {
+            text += ev.text;
+            onDelta?.(text);
+          }
+        }
+        const trimmed = text.trim();
+        return trimmed ? { summary: trimmed } : { error: '模型未返回摘要内容' };
+      } catch (err) {
+        const e = err instanceof LLMError ? err : new LLMError('unknown', String((err as Error)?.message ?? err), {});
+        return { error: friendlyLLMMessage(e), retryable: e.retryable };
+      }
+    };
+    let res = await run();
+    if (!res.summary && res.retryable && !signal.aborted) {
+      onDelta?.('');
+      await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+      res = await run();
+    }
+    return { ...(res.summary ? { summary: res.summary } : {}), ...(res.error ? { error: res.error } : {}) };
   }
 
   // ---- 消息 ----
@@ -638,32 +802,39 @@ export class SessionManager implements AgentProvider {
     }
   }
 
-  /** 手动压缩上下文：立即把旧历史折叠为摘要 checkpoint（非破坏）。不受 auto 开关限制；返回是否实际压缩 */
+  /** 手动压缩上下文：把旧历史折叠为摘要 checkpoint（非破坏）。不受 auto 开关限制；
+   * 跨会话并行执行（切换会话不影响），并行上限复用 maxConcurrency、超出 FIFO 排队；
+   * 仅限 idle 会话；返回是否实际压缩（false=无可压缩内容）；摘要调用失败抛错（UI 区分"失败/没得压"） */
   async compactSession(sessionId: string): Promise<boolean> {
     const storage = this.opts.db.storage;
     const session = storage.getSession(sessionId);
     if (!session) throw new Error('会话不存在');
     if (session.status !== 'idle') throw new Error('会话正在运行，无法压缩');
+    if (this.compactingSessions.has(sessionId) || this.manualCompactionQueued.has(sessionId)) throw new Error(COMPACTION_BUSY);
+    this.manualCompactionQueued.add(sessionId);
     const settings = await this.opts.config.read();
     const target = this.gateway.resolveChat(settings, session.modelId);
-    const history = pruneHistory(this.historyWindow(sessionId).messages);
     // contextLimit 未知（<=0）或 auto 关闭时传极大预算：尾部预算钳到 15k + 条数上限 200，按此压缩
-    const usable = this.compactionUsable(target.contextLimit, settings) ?? Number.MAX_SAFE_INTEGER;
-    const controller = new AbortController();
-    const ok = await this.maybeCompact({
-      sessionId,
-      settings,
-      target,
-      signal: controller.signal,
-      history,
-      usable,
-    });
-    // 压缩成功 → 重算新窗口占用并推送，右侧面板百分比立即回落
-    if (ok) {
-      const ctx = await this.computeContext(sessionId);
-      if (ctx) this.emit({ sessionId, type: 'session.context', ...ctx });
+    const usable = this.compactionUsable(target.contextLimit, settings, target.maxOutput) ?? Number.MAX_SAFE_INTEGER;
+    // 排队等槽位；拿到槽位后复核状态并重读窗口（排队期间可能有新消息/会话已开始运行/被删除）
+    const release = await this.acquireCompactionSlot();
+    try {
+      const current = storage.getSession(sessionId);
+      if (!current) throw new Error('会话不存在');
+      if (current.status !== 'idle') throw new Error('会话正在运行，无法压缩');
+      const history = pruneHistory(this.historyWindow(sessionId).messages);
+      const result = await this.executeCompaction({ sessionId, settings, target, history, usable });
+      if (!result.compacted && result.error) throw new Error(result.error);
+      // 压缩成功 → 重算新窗口占用并推送，右侧面板百分比立即回落
+      if (result.compacted) {
+        const ctx = await this.computeContext(sessionId);
+        if (ctx) this.emit({ sessionId, type: 'session.context', ...ctx });
+      }
+      return result.compacted;
+    } finally {
+      this.manualCompactionQueued.delete(sessionId);
+      release();
     }
-    return ok;
   }
 
   /** 当前上下文占用（切换会话时初始拉取；此后由各发射点推送 session.context 事件） */
@@ -1388,9 +1559,11 @@ export class SessionManager implements AgentProvider {
       };
 
       streamAcc = '';
-      const turnToolCalls: { callID: string; tool: string; input: unknown }[] = [];
-      let turnFinish = '';
+      const turnToolCalls: { callID: string; tool: string; input: unknown; parseError?: string }[] = [];
       let streamError: LLMError | undefined;
+      // callID → 已挂卡片下标（流中 start 建 pending 卡，执行时复用同一张卡）
+      const callCardIdx = new Map<string, number>();
+      const callCardTool = new Map<string, string>();
       const stream = this.engineFor(target).stream(target.binding, request);
       try {
         for await (const ev of stream) {
@@ -1399,10 +1572,17 @@ export class SessionManager implements AgentProvider {
             const part: MessagePart = { type: 'text', text: `[agent] ${streamAcc}` };
             if (agentTextIdx < 0) agentTextIdx = append(part);
             else update(agentTextIdx, part);
+          } else if (ev.type === 'tool-call-start') {
+            // 流中即建 pending 卡（与主循环同口径）；callID 缺失时等 tool-call 事件再建卡
+            if (ev.callID && !callCardIdx.has(ev.callID)) {
+              callCardIdx.set(ev.callID, append({ type: 'tool-call', tool: ev.tool, callID: ev.callID, input: {}, state: 'pending' }));
+              callCardTool.set(ev.callID, ev.tool);
+            }
           } else if (ev.type === 'tool-call') {
-            turnToolCalls.push({ callID: ev.callID, tool: ev.tool, input: ev.input });
+            turnToolCalls.push({ callID: ev.callID, tool: ev.tool, input: ev.input, ...(ev.parseError ? { parseError: ev.parseError } : {}) });
+            const idx = callCardIdx.get(ev.callID);
+            if (idx !== undefined) update(idx, { type: 'tool-call', tool: ev.tool, callID: ev.callID, input: ev.input, state: 'running' });
           } else if (ev.type === 'finish') {
-            turnFinish = ev.finishReason;
             if (ev.usage) this.reportUsage(sessionId, target.modelId, ev.usage);
           } else if (ev.type === 'error') {
             streamError = ev.error;
@@ -1414,31 +1594,46 @@ export class SessionManager implements AgentProvider {
 
       if (signal.aborted) {
         exhausted = false;
+        // 中断时 pending 卡标记 error，避免脚本消息里永远"执行中"
+        for (const [cid, idx] of callCardIdx) {
+          update(idx, { type: 'tool-call', tool: callCardTool.get(cid) ?? '', callID: cid, input: {}, state: 'error' });
+        }
         return finalText || streamAcc;
       }
       if (streamError) {
         if (agentTextIdx >= 0) update(agentTextIdx, { type: 'text', text: `[agent] ${streamAcc}` });
+        // 流中失败的 pending 卡标记 error，避免脚本消息里永远"执行中"
+        for (const [cid, idx] of callCardIdx) {
+          update(idx, { type: 'tool-call', tool: callCardTool.get(cid) ?? '', callID: cid, input: {}, state: 'error' });
+        }
         throw new Error(friendlyLLMMessage(streamError));
       }
 
-      if (turnFinish === 'tool_calls' && turnToolCalls.length > 0) {
+      // 不依赖 finish_reason：部分平台 stop 也携带工具调用（与主循环同口径）
+      if (turnToolCalls.length > 0) {
         messages.push({
           role: 'assistant',
           content: streamAcc || null,
-          toolCalls: turnToolCalls.map((t) => ({
-            id: t.callID,
-            name: t.tool,
-            arguments: typeof t.input === 'string' ? t.input : JSON.stringify(t.input ?? {}),
-          })),
+          // 空工具名的调用不回传（provider 会 400）；其错误仅作为卡片展示
+          toolCalls: turnToolCalls
+            .filter((t) => t.tool.trim() !== '')
+            .map((t) => ({
+              id: t.callID,
+              name: t.tool,
+              arguments: typeof t.input === 'string' ? t.input : JSON.stringify(t.input ?? {}),
+            })),
         });
         for (const tc of turnToolCalls) {
           // MCP 工具不在注册表：从本轮并入的 mcpTools 中查找（与主循环同口径）
           const def = registry.get(tc.tool) ?? (tc.tool.startsWith('mcp_') ? mcpTools.find((t) => t.id === tc.tool) : undefined);
           let resultContent: string;
           let ok = true;
-          // 先挂 running 卡片：reportProgress 实时更新标题（长任务进度，如视频生成轮询）
-          const callIdx = append({ type: 'tool-call', tool: tc.tool, callID: tc.callID, input: tc.input, state: 'running' });
-          if (!def || INTERNAL_TOOLS.includes(tc.tool)) {
+          // 复用流中已建的 pending 卡（无则现挂）：reportProgress 实时更新标题（长任务进度）
+          const callIdx = callCardIdx.get(tc.callID) ?? append({ type: 'tool-call', tool: tc.tool, callID: tc.callID, input: tc.input, state: 'running' });
+          if (tc.parseError) {
+            resultContent = `工具调用参数解析失败：${tc.parseError}`;
+            ok = false;
+          } else if (!def || INTERNAL_TOOLS.includes(tc.tool)) {
             resultContent = `未知工具：${tc.tool}`;
             ok = false;
           } else {
@@ -1481,7 +1676,7 @@ export class SessionManager implements AgentProvider {
             state: ok ? 'completed' : 'error',
           });
           append({ type: 'tool-result', callID: tc.callID, output: ok ? resultContent : null, state: ok ? 'completed' : 'error', error: ok ? undefined : resultContent });
-          messages.push({ role: 'tool', content: resultContent, toolCallId: tc.callID });
+          if (tc.tool.trim() !== '') messages.push({ role: 'tool', content: resultContent, toolCallId: tc.callID });
         }
         continue;
       }
@@ -1527,10 +1722,11 @@ export class SessionManager implements AgentProvider {
       await this.finalizeMessage(sessionId, messageId, parts, createdAt, usage);
     };
 
-    // 中断时把仍处于 running 的 tool-call 补成 error 结果，保证当前消息与后续请求一致
+    // 中断时把仍处于 pending/running 的 tool-call 补成 error 结果，保证当前消息与后续请求一致
     const completeInterruptedTools = (messageId: string, parts: MessagePart[]): void => {
       const running = parts.filter(
-        (p): p is Extract<MessagePart, { type: 'tool-call' }> => p.type === 'tool-call' && p.state === 'running',
+        (p): p is Extract<MessagePart, { type: 'tool-call' }> =>
+          p.type === 'tool-call' && (p.state === 'running' || p.state === 'pending'),
       );
       if (running.length === 0) return;
       for (const cp of running) {
@@ -1593,6 +1789,8 @@ export class SessionManager implements AgentProvider {
     let stepsExhausted = false;
     // 用户拒绝标记：权限/提问被拒后终止本轮（对齐 opencode；continueLoopOnDeny=true 可保留旧行为）
     let denyStopReason = '';
+    // 连续"全无效工具调用"轮数（未知工具/参数解析失败）：≥3 终止并提示，防无限空转
+    let invalidTurns = 0;
     // 上一轮生效的 agent id（检测 plan→build 切换，供切换提醒一次性注入）
     let prevAgentId = agent?.id;
 
@@ -1635,26 +1833,38 @@ export class SessionManager implements AgentProvider {
         });
         // 上下文压缩：溢出检测（估算 ∨ 上次真实 usage）→ 摘要 checkpoint → 仍超限丢最旧重试 ≤1；
         // contextLimit<=0 / auto=false 时跳过；工具输出持续 prune（请求侧，DB 不动）
-        const compactUsable = this.compactionUsable(turnTarget.contextLimit, settings);
+        const compactUsable = this.compactionUsable(turnTarget.contextLimit, settings, turnTarget.maxOutput);
         const window0 = this.historyWindow(sessionId);
         let history = pruneHistory(window0.messages);
         // 窗口饱和（>300 条且窗口内无可见 checkpoint）→ 即使 token 未超预算也强制压缩，避免历史被静默丢弃
         const saturationCompact = window0.saturated && settings.general.compaction.auto;
+        // 工具 schema 随请求发送并计入窗口（消息估算不含它）；请求侧统一复用同一份序列化
+        const toolsSchema = canTool && tools.length > 0 ? registry.toOpenAI(tools) : undefined;
+        const toolsTokens = estimateToolsTokens(toolsSchema);
         let requestMessages = buildRequestMessages(history, composeSystemPrompt(turnAgent), envBlock + mcpNote, turnTarget.vision, turnReminder);
-        let est = Math.max(estimateRequestTokens(requestMessages), lastUsageTokens(history));
+        let est = Math.max(estimateRequestTokens(requestMessages) + toolsTokens, lastUsageTokens(history));
+        // 需要压缩但因失败没压成的错误（自动压缩失败时插入可见 error part，不再静默）
+        let autoCompactError: string | undefined;
         if ((compactUsable !== null && est >= compactUsable) || saturationCompact) {
-          // 饱和触发的压缩不依赖 token 预算：usable 传极大值（尾部预算钳到 15k + 条数上限 200）
-          await this.maybeCompact({
-            sessionId,
-            settings,
-            target: turnTarget,
-            signal,
-            history,
-            usable: compactUsable ?? Number.MAX_SAFE_INTEGER,
-          });
+          // 统一走 executeCompaction（时间线流式显示）；单飞冲突（同会话已有压缩任务）→ 静默跳过，下轮复查
+          if (!this.compactingSessions.has(sessionId)) {
+            // 饱和触发的压缩不依赖 token 预算：usable 传极大值（尾部预算钳到 15k + 条数上限 200）
+            const compactResult = await this.executeCompaction({
+              sessionId,
+              settings,
+              target: turnTarget,
+              signal,
+              history,
+              usable: compactUsable ?? Number.MAX_SAFE_INTEGER,
+            });
+            if (!compactResult.compacted && compactResult.error && compactResult.error !== COMPACTION_BUSY) {
+              autoCompactError = compactResult.error;
+            }
+          }
           history = pruneHistory(this.historyWindow(sessionId).messages);
           requestMessages = buildRequestMessages(history, composeSystemPrompt(turnAgent), envBlock + mcpNote, turnTarget.vision, turnReminder);
-          est = Math.max(estimateRequestTokens(requestMessages), lastUsageTokens(history));
+          // 压缩后用纯估算复查：checkpoint 已存在，压缩前的旧 usage 口径失效（会误判仍超限）
+          est = estimateRequestTokens(requestMessages) + toolsTokens;
           if (compactUsable !== null && est >= compactUsable) {
             const start = this.lastCompactionIndex(history) === 0 ? 1 : 0;
             if (start < history.length) {
@@ -1668,15 +1878,15 @@ export class SessionManager implements AgentProvider {
         // 上下文仪表：复用本轮请求估算（含 system prompt/env/MCP 说明），零额外计算；
         // 窗口含 checkpoint 时上次真实 usage 口径失效（测量自压缩前更大的窗口），改用纯估算。
         // 溢出检测用的 est 保持 max 混合口径，不受影响
-        const gaugeUsed = this.lastCompactionIndex(history) >= 0 ? estimateRequestTokens(requestMessages) : est;
+        const gaugeUsed = this.lastCompactionIndex(history) >= 0 ? estimateRequestTokens(requestMessages) + toolsTokens : est;
         this.emit({ sessionId, type: 'session.context', used: gaugeUsed, limit: turnTarget.contextLimit });
-        const request: ChatReq = {
+        let request: ChatReq = {
           messages: requestMessages,
           thinking: turnThinking,
           maxTokens: turnTarget.maxOutput > 0 ? turnTarget.maxOutput : undefined,
           signal,
           options: turnTarget.options,
-          tools: canTool && tools.length > 0 ? registry.toOpenAI(tools) : undefined,
+          ...(toolsSchema ? { tools: toolsSchema } : {}),
         };
 
         const assistantId = nextId('a');
@@ -1686,60 +1896,182 @@ export class SessionManager implements AgentProvider {
         lastAssistantId = assistantId;
         lastParts = parts;
 
+        // 自动压缩失败的可见提示（error part 不终止循环；若请求随后真溢出，还会走压缩自愈重试）
+        if (autoCompactError) {
+          const idx = parts.length;
+          parts.push({ type: 'error', message: `上下文自动压缩失败：${autoCompactError}` });
+          emitPart(assistantId, idx, parts[idx]!, true);
+          storage.updateMessageParts(assistantId, parts);
+        }
+
         let reasoningAcc = '';
         let textAcc = '';
-        const turnToolCalls: { callID: string; tool: string; input: unknown }[] = [];
-        let turnFinish: string | undefined;
+        // part 索引 append-only 分配：text/reasoning 槽位不再写死 0/1，流中插入 pending 工具卡不会被覆盖
+        let reasoningIdx = -1;
+        let textIdx = -1;
+        // callID → 工具卡 part 下标（流中 start 建卡，complete 事件按 callID upsert，避免重复卡片）
+        const toolPartIdx = new Map<string, number>();
+        const turnToolCalls: { callID: string; tool: string; input: unknown; parseError?: string }[] = [];
         let streamError: LLMError | undefined;
 
-        const stream = this.engineFor(turnTarget).stream(turnTarget.binding, request);
-        try {
-          for await (const ev of stream) {
-            switch (ev.type) {
-              case 'reasoning-delta': {
-                reasoningAcc += stripThinkTags(ev.text);
-                parts[0] = { type: 'reasoning', text: reasoningAcc };
-                emitPart(assistantId, 0, parts[0]!);
-                storage.updateMessageParts(assistantId, parts);
-                break;
-              }
-              case 'text-delta': {
-                textAcc += ev.text;
-                const idx = reasoningAcc ? 1 : 0;
-                parts[idx] = { type: 'text', text: textAcc };
-                emitPart(assistantId, idx, parts[idx]!);
-                storage.updateMessageParts(assistantId, parts);
-                break;
-              }
-              case 'tool-call': {
-                turnToolCalls.push({ callID: ev.callID, tool: ev.tool, input: ev.input });
-                const idx = parts.length;
-                parts[idx] = { type: 'tool-call', tool: ev.tool, callID: ev.callID, input: ev.input, state: 'running' };
-                emitPart(assistantId, idx, parts[idx]!);
-                storage.updateMessageParts(assistantId, parts);
-                break;
-              }
-              case 'finish':
-                turnFinish = ev.finishReason;
-                if (ev.usage) {
-                  providerUsage = ev.usage;
-                  // 逐轮落库+广播：Token 统计随每次 LLM 请求实时刷新，不再等整轮结束
-                  this.reportUsage(sessionId, turnTarget.modelId, ev.usage);
+        // 流式 delta 落库节流（200ms）：高频 delta 只发事件不逐条写 DB，结束时由 finalizeMessage 兜底
+        let lastPersistAt = 0;
+        const persistPartsThrottled = (): void => {
+          const now = Date.now();
+          if (now - lastPersistAt < 200) return;
+          lastPersistAt = now;
+          storage.updateMessageParts(assistantId, parts);
+        };
+
+        // 消费一轮 LLM 流（抽出以便重试复用；累积器/索引跨重试保留，由 resetForRetry 清理）
+        const consumeStream = async (req: ChatReq): Promise<void> => {
+          const stream = this.engineFor(turnTarget).stream(turnTarget.binding, req);
+          try {
+            for await (const ev of stream) {
+              switch (ev.type) {
+                case 'reasoning-delta': {
+                  reasoningAcc += stripThinkTags(ev.text);
+                  if (reasoningIdx < 0) {
+                    reasoningIdx = parts.length;
+                    parts.push({ type: 'reasoning', text: reasoningAcc });
+                  } else {
+                    parts[reasoningIdx] = { type: 'reasoning', text: reasoningAcc };
+                  }
+                  emitPart(assistantId, reasoningIdx, parts[reasoningIdx]!);
+                  persistPartsThrottled();
+                  break;
                 }
-                break;
-              case 'error':
-                streamError = ev.error;
-                break;
+                case 'text-delta': {
+                  textAcc += ev.text;
+                  if (textIdx < 0) {
+                    textIdx = parts.length;
+                    parts.push({ type: 'text', text: textAcc });
+                  } else {
+                    parts[textIdx] = { type: 'text', text: textAcc };
+                  }
+                  emitPart(assistantId, textIdx, parts[textIdx]!);
+                  persistPartsThrottled();
+                  break;
+                }
+                case 'tool-call-start': {
+                  // 流中即建卡（pending）：模型一开始发工具调用就立即可见，不再等整条流结束
+                  if (!ev.callID || toolPartIdx.has(ev.callID)) break;
+                  const idx = parts.length;
+                  parts.push({ type: 'tool-call', tool: ev.tool, callID: ev.callID, input: {}, state: 'pending' });
+                  toolPartIdx.set(ev.callID, idx);
+                  emitPart(assistantId, idx, parts[idx]!);
+                  persistPartsThrottled();
+                  break;
+                }
+                case 'tool-call-delta':
+                  // 参数增量不逐条广播（pending 卡已可见，参数完整时由 tool-call 一次性更新）
+                  break;
+                case 'tool-call': {
+                  turnToolCalls.push({ callID: ev.callID, tool: ev.tool, input: ev.input, ...(ev.parseError ? { parseError: ev.parseError } : {}) });
+                  const part: MessagePart = { type: 'tool-call', tool: ev.tool, callID: ev.callID, input: ev.input, state: 'running' };
+                  const existing = toolPartIdx.get(ev.callID);
+                  if (existing !== undefined) {
+                    parts[existing] = part;
+                    emitPart(assistantId, existing, part);
+                  } else {
+                    const idx = parts.length;
+                    parts.push(part);
+                    toolPartIdx.set(ev.callID, idx);
+                    emitPart(assistantId, idx, part);
+                  }
+                  persistPartsThrottled();
+                  break;
+                }
+                case 'finish':
+                  if (ev.usage) {
+                    providerUsage = ev.usage;
+                    // 逐轮落库+广播：Token 统计随每次 LLM 请求实时刷新，不再等整轮结束
+                    this.reportUsage(sessionId, turnTarget.modelId, ev.usage);
+                  }
+                  break;
+                case 'error':
+                  streamError = ev.error;
+                  break;
+              }
+            }
+          } catch (err) {
+            streamError = err instanceof LLMError ? err : new LLMError('unknown', String((err as Error)?.message ?? err), {});
+          }
+        };
+
+        await consumeStream(request);
+
+        // ---- 循环级重试 / 溢出自愈（对齐 opencode：可重试错误退避重发，溢出先压缩再重试）----
+        const RETRY_MAX_ATTEMPTS = 3; // 总发送次数上限（含首次；重试事件显示 2/3、3/3）
+        let attempt = 1;
+        let compactedForOverflow = false;
+        while (streamError && !signal.aborted) {
+          if (streamError.kind === 'context_overflow' && !compactedForOverflow) {
+            // 溢出自愈：压缩后重建请求重试本轮（不占用重试次数；仅自愈一次）。
+            // 统一走 executeCompaction（时间线流式显示）；单飞冲突时视为无法压缩
+            compactedForOverflow = true;
+            const res = await this.executeCompaction({
+              sessionId,
+              settings,
+              target: turnTarget,
+              signal,
+              history: pruneHistory(this.historyWindow(sessionId).messages),
+              usable: compactUsable ?? Number.MAX_SAFE_INTEGER,
+            });
+            if (!res.compacted) break; // 无法压缩（含已在压缩中）→ 走错误终局
+            history = pruneHistory(this.historyWindow(sessionId).messages);
+            requestMessages = buildRequestMessages(history, composeSystemPrompt(turnAgent), envBlock + mcpNote, turnTarget.vision, turnReminder);
+            this.emit({ sessionId, type: 'session.context', used: estimateRequestTokens(requestMessages) + toolsTokens, limit: turnTarget.contextLimit });
+            request = { ...request, messages: requestMessages };
+          } else if (!streamError.retryable || attempt >= RETRY_MAX_ATTEMPTS) {
+            break; // 不可重试（auth/quota/invalid）或重试耗尽 → 错误终局
+          } else {
+            const delayMs = Math.max(streamError.retryAfterMs ?? 0, Math.min(2000 * 2 ** (attempt - 1), 30_000));
+            attempt += 1;
+            this.emit({ sessionId, type: 'session.retry', attempt, maxAttempts: RETRY_MAX_ATTEMPTS, delayMs, message: friendlyLLMMessage(streamError) });
+            await new Promise<void>((resolve) => {
+              const onAbort = (): void => {
+                clearTimeout(timer);
+                signal.removeEventListener('abort', onAbort);
+                resolve();
+              };
+              const timer = setTimeout(() => {
+                signal.removeEventListener('abort', onAbort);
+                resolve();
+              }, delayMs);
+              signal.addEventListener('abort', onAbort, { once: true });
+            });
+            if (signal.aborted) break;
+          }
+          // 重试前清理：半截文本清空（重发会从头生成，保留旧片段会出现断句+重复）；
+          // pending/running 卡标记为 error 但不追加结果——重试若复用同一 callID 则该卡复活并正常配对，
+          // 未复用时缺失结果由请求构建兜底合成「未执行/已中断」（appendInterrupted 会造成重复 result 配对）
+          if (reasoningIdx >= 0 && parts[reasoningIdx]) {
+            parts[reasoningIdx] = { type: 'reasoning', text: '' };
+            emitPart(assistantId, reasoningIdx, parts[reasoningIdx]!, true);
+          }
+          if (textIdx >= 0 && parts[textIdx]) {
+            parts[textIdx] = { type: 'text', text: '' };
+            emitPart(assistantId, textIdx, parts[textIdx]!, true);
+          }
+          reasoningAcc = '';
+          textAcc = '';
+          for (let i = 0; i < parts.length; i++) {
+            const p = parts[i]!;
+            if (p.type === 'tool-call' && (p.state === 'pending' || p.state === 'running')) {
+              parts[i] = { ...p, state: 'error' };
+              emitPart(assistantId, i, parts[i]!, true);
             }
           }
-        } catch (err) {
-          streamError = err instanceof LLMError ? err : new LLMError('unknown', String((err as Error)?.message ?? err), {});
+          storage.updateMessageParts(assistantId, parts);
+          turnToolCalls.length = 0;
+          streamError = undefined;
+          await consumeStream(request);
         }
 
         if (signal.aborted) {
-          if (reasoningAcc && parts[0]) emitPart(assistantId, 0, parts[0]!, true);
-          const textIdx = reasoningAcc ? 1 : 0;
-          if (textAcc && parts[textIdx]) emitPart(assistantId, textIdx, parts[textIdx]!, true);
+          if (reasoningAcc && reasoningIdx >= 0 && parts[reasoningIdx]) emitPart(assistantId, reasoningIdx, parts[reasoningIdx]!, true);
+          if (textAcc && textIdx >= 0 && parts[textIdx]) emitPart(assistantId, textIdx, parts[textIdx]!, true);
           completeInterruptedTools(assistantId, parts);
           break;
         }
@@ -1749,19 +2081,24 @@ export class SessionManager implements AgentProvider {
           break;
         }
 
-        if (reasoningAcc && parts[0]) emitPart(assistantId, 0, parts[0]!, true);
-        const textIdx = reasoningAcc ? 1 : 0;
-        if (textAcc && parts[textIdx]) emitPart(assistantId, textIdx, parts[textIdx]!, true);
+        if (reasoningAcc && reasoningIdx >= 0 && parts[reasoningIdx]) emitPart(assistantId, reasoningIdx, parts[reasoningIdx]!, true);
+        if (textAcc && textIdx >= 0 && parts[textIdx]) emitPart(assistantId, textIdx, parts[textIdx]!, true);
 
-        // 工具调用：执行后继续下一轮
-        if (turnFinish === 'tool_calls' && turnToolCalls.length > 0) {
+        // 工具调用：执行后继续下一轮（不依赖 finish_reason：部分平台 stop 也携带工具调用，对齐 opencode）
+        if (turnToolCalls.length > 0) {
           let hadValid = false;
           for (const tc of turnToolCalls) {
             if (signal.aborted) break;
             // MCP 工具不在注册表：从本轮并入的 mcpTools 中查找
             const def = registry.get(tc.tool) ?? (tc.tool.startsWith('mcp_') ? mcpTools.find((t) => t.id === tc.tool) : undefined);
-            // 未知/空工具：不询问权限，直接错误结果（避免挂起"执行中"）
-            if (!def) {
+            // 未知/空工具/参数解析失败：不询问权限，直接错误结果（避免挂起"执行中"）；
+            // 错误结果回传模型自我纠正（不再因 !hadValid 直接终止 loop）
+            if (tc.parseError || !def) {
+              const reason = tc.parseError
+                ? `工具调用参数解析失败：${tc.parseError}`
+                : tc.tool
+                  ? `未知工具：${tc.tool}`
+                  : '模型返回了空的工具调用';
               const callIdx = parts.findIndex((p) => p.type === 'tool-call' && p.callID === tc.callID);
               if (callIdx >= 0) {
                 const callPart = parts[callIdx] as Extract<MessagePart, { type: 'tool-call' }>;
@@ -1774,7 +2111,7 @@ export class SessionManager implements AgentProvider {
                 callID: tc.callID,
                 output: null,
                 state: 'error',
-                error: tc.tool ? `未知工具：${tc.tool}` : '模型返回了空的工具调用',
+                error: reason,
               };
               emitPart(assistantId, resultIdx, parts[resultIdx]!, true);
               storage.updateMessageParts(assistantId, parts);
@@ -1901,8 +2238,20 @@ export class SessionManager implements AgentProvider {
           if (signal.aborted) break;
           // 用户拒绝：终止本轮，不再发起下一次请求（工具结果已落库，配对完整）
           if (denyStopReason) break;
-          // 本轮全部为无效工具调用 → 结束循环，避免空转"一直执行中"
-          if (!hadValid) break;
+          // 本轮全部为无效工具调用：错误结果已回传，模型可在下一轮纠正；
+          // 连续多轮全无效才终止（防未知工具死循环空转），并给可见提示
+          if (!hadValid) {
+            invalidTurns += 1;
+            if (invalidTurns >= 3) {
+              const idx = parts.length;
+              parts[idx] = { type: 'text', text: '连续多轮工具调用无效（未知工具或参数异常），本轮到此停止。请检查工具配置或换用其他方式后重试。' };
+              emitPart(assistantId, idx, parts[idx]!, true);
+              storage.updateMessageParts(assistantId, parts);
+              break;
+            }
+            continue;
+          }
+          invalidTurns = 0;
           continue;
         }
 

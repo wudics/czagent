@@ -1,4 +1,4 @@
-import { useMarkdown } from '../../markdown/useMarkdown';
+import { useMarkdown, escapeHtmlText } from '../../markdown/useMarkdown';
 import { cn } from '../../lib/utils';
 
 export function Markdown({ text, className }: { text: string; className?: string }) {
@@ -7,7 +7,8 @@ export function Markdown({ text, className }: { text: string; className?: string
   return (
     <div
       className={cn('markdown-body', className)}
-      dangerouslySetInnerHTML={{ __html: html || text }}
+      // html 已在 useMarkdown 内消毒；解析未就绪/失败时显示转义纯文本，杜绝原始 HTML 注入
+      dangerouslySetInnerHTML={{ __html: html || escapeHtmlText(text) }}
     />
   );
 }

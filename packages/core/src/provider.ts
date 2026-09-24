@@ -58,7 +58,8 @@ export interface SessionContext {
 
 export type MessagePart =
   | { type: 'text'; text: string; /** 仅展示不进请求（如 plan 工具的可见计划全文）；buildRequestMessages 跳过 */ synthetic?: boolean }
-  | { type: 'reasoning'; text: string }
+  /** time：思考起止（渲染折叠"思考 Ns"；start=首个 delta，end=首个正文/工具或流结束） */
+  | { type: 'reasoning'; text: string; time?: { start: number; end?: number } }
   | { type: 'image'; dataUrl: string; name?: string }
   | {
       type: 'tool-call';

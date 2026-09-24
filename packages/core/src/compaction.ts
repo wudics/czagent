@@ -26,7 +26,11 @@ export const PRUNE_PROTECT_USER_TURNS = 2;
 /** 保留尾部 token 预算钳制（对齐 opencode：min(15k, max(2k, usable×比例))） */
 export const TAIL_BUDGET_MIN = 2_000;
 export const TAIL_BUDGET_MAX = 15_000;
-/** 保留尾部消息数上限（请求窗口 300 条，尾部 ≤200 留出新空间，避免饱和压缩后立刻再次饱和） */
+/** 请求窗口一次加载的最大消息数（DB 分页上限；超出即窗口截断，由压缩按占用门槛收敛） */
+export const HISTORY_WINDOW_MESSAGES = 2_000;
+/** 饱和强制压缩触发比例：估算 ≥ usable×该比例才允许"仅因条数超限"压缩（低占比不再无脑全窗压缩） */
+export const SATURATION_COMPACT_RATIO = 0.5;
+/** 保留尾部消息数上限（尾部 ≤200 留出新空间，避免压缩后立即再次逼近条数上限） */
 export const TAIL_MAX_MESSAGES = 200;
 
 const CJK_RE = /[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/;
@@ -79,10 +83,44 @@ export function estimateToolsTokens(tools: unknown): number {
   return Math.ceil(JSON.stringify(tools).length / 4) + tools.length * MESSAGE_OVERHEAD_TOKENS;
 }
 
-/** provider usage 折算为"上次请求的上下文规模"（对齐 opencode 口径：input+output+cache 全加） */
+/**
+ * provider usage 折算为"该次请求的上下文规模"：input(prompt_tokens) 已含缓存读写、
+ * output(completion_tokens) 已含 reasoning（OpenAI 语义子集）——再叠子集字段会重复计
+ * （DeepSeek 等命中 90%+ 时虚高 2~3 倍，导致远未到真实阈值就触发压缩）。
+ * opencode 五字段互斥全加，与本式数值等价。
+ */
 export function usageTotal(u?: Usage): number {
   if (!u) return 0;
-  return u.inputTokens + u.outputTokens + u.reasoningTokens + u.cacheReadTokens + u.cacheWriteTokens;
+  return u.inputTokens + u.outputTokens;
+}
+
+/** 最后一个 compaction checkpoint 在消息数组中的下标；无则 -1 */
+export function findLastCompactionIndex(messages: ChatMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.parts.some((p) => p.type === 'compaction')) return i;
+  }
+  return -1;
+}
+
+/**
+ * 上下文占用统一口径（对齐 opencode estimateTokens：真实 usage 锚点 + 锚点后增量）。
+ * 锚点 = 最后一个 checkpoint 之后、最近一条带真实 usage（inputTokens>0）的 assistant 消息；
+ * usageTotal 覆盖构建该请求时的全部前文（system/env/tools/更早历史），锚点之后的新消息
+ * （用户补充、工具结果等）用 estimateMessageTokens 累加。
+ * 压缩刚完成还没有新锚点（checkpoint 之后无带 usage 的消息）→ 回退纯估算 fallback，
+ * 避免拿压缩前的旧 usage 误判"仍超限"。
+ */
+export function estimateContextUsed(history: ChatMessage[], fallback: number): number {
+  const cp = findLastCompactionIndex(history);
+  for (let i = history.length - 1; i > cp; i--) {
+    const m = history[i]!;
+    if (m.role === 'assistant' && m.tokens && m.tokens.inputTokens > 0) {
+      let after = 0;
+      for (let j = i + 1; j < history.length; j++) after += estimateMessageTokens(history[j]!);
+      return usageTotal(m.tokens) + after;
+    }
+  }
+  return fallback;
 }
 
 function toolOutputText(output: unknown): string {
@@ -173,4 +211,74 @@ export function selectTailStart(history: ChatMessage[], headIdx: number, budget:
 export function tailBudget(usable: number, preserveRatio: number): number {
   const raw = Math.floor(usable * (preserveRatio > 0 ? preserveRatio : 0.25));
   return Math.min(TAIL_BUDGET_MAX, Math.max(TAIL_BUDGET_MIN, raw));
+}
+
+// ---- 摘要指令（对齐 opencode buildPrompt/hasSummarySection：模板派生校验集，永不脱钩）----
+
+/** 结构化摘要模板（opencode SUMMARY_TEMPLATE 的中文适配版） */
+const SUMMARY_TEMPLATE = [
+  '## 任务目标',
+  '- [一两句话说明用户在达成什么]',
+  '',
+  '## 要求与约束',
+  '- [用户给出的约束/偏好/范围边界；无则写（无）]',
+  '',
+  '## 决定',
+  '- [已做出并生效的决定及理由；无则写（无）]',
+  '',
+  '## 工作状态',
+  '- [把目标拆小：已完成什么 / 正在做什么 / 被什么阻塞（及原因）]',
+  '',
+  '## 下一步',
+  '1. [接下来应做的有序步骤；无则写（无）]',
+  '',
+  '## 相关文件',
+  '- [后续工作最可能要打开的文件/目录，最重要的在前，≤15 条：`路径`：一句话为什么相关]',
+  '',
+  '## 关键上下文',
+  '- [下一个助手不拿到就续不下去、且无法自行查到的事实；无则写（无）]',
+].join('\n');
+
+const SUMMARY_RULES = [
+  '规则：',
+  '- 各小节简洁：短单行要点，不要长段落或嵌套列表。',
+  '- 宁可简短指代、不要详细复述：后续助手能从代码与文件中自行查到的就不展开。',
+  '- 精确保留文件路径、符号名、命令、错误原文、URL 与标识符。',
+  '- 只带仍未解决/仍需处理的用户问题，已在较新历史里被回答的不重复；要带的保留原话。',
+  '- 保留工作流程状态：改动是未提交/已提交/已推送等要写清。',
+  '- 不要提及本摘要的生成过程，也不要说"上下文被压缩"之类的话。',
+].join('\n');
+
+/** 模板小节标题集合：由模板逐行派生，校验与提示词永不脱钩 */
+export const SUMMARY_HEADINGS = SUMMARY_TEMPLATE.split('\n').filter((line) => line.trim().startsWith('##'));
+
+/** 摘要指令（作为请求的最后一条 user 消息发出，不依赖历史里是否有 user 轮） */
+export function buildSummaryInstruction(previousSummary?: string): string {
+  const prev = previousSummary?.trim();
+  const blocks: string[] = [];
+  if (prev) {
+    blocks.push(
+      '请总结以上用户与助手的全部对话和动作，产出一份结构化摘要——它将交给另一个助手据此继续工作。\n\n' +
+        '<既有摘要>\n' +
+        prev +
+        '\n</既有摘要>\n\n' +
+        '把 <既有摘要> 与上文历史合并为一份新摘要：更近的历史优先于既有摘要；保留其中仍然成立的约束、决定与未解决问题，按新事实修正过时细节（改写的按新事实写，不保留旧表述）；与继续工作无关的内容可以删除。',
+    );
+  } else {
+    blocks.push('请总结以上用户与助手的全部对话和动作，产出一份结构化摘要——它将交给另一个助手据此继续工作。');
+  }
+  blocks.push('只总结对话与动作本身；不是用户口述的设定（仓库约定、AGENTS.md 等指令文件、环境信息）不要写入——后续助手会另行获得最新版本。');
+  blocks.push(`摘要必须使用以下小节模板（不适用的小节可省略，不要输出模板标签本身）：\n${SUMMARY_TEMPLATE}`);
+  blocks.push(SUMMARY_RULES);
+  blocks.push('不要继续执行任务、不要调用任何工具。只返回按上述小节标题组织的摘要正文，不要前言、解释或其他额外内容。');
+  return blocks.join('\n\n');
+}
+
+/** 结构校验失败后的追问指令（opencode 同款：追加在第一次指令之后，不携带上一轮输出） */
+export const SUMMARY_REMINDER =
+  '上一轮回复没有按要求填写摘要模板。不要调用任何工具，仅以文本、按上文小节标题返回摘要正文。';
+
+/** 输出是否为合规摘要（opencode hasSummarySection：逐行 trim 命中模板标题即有效） */
+export function hasSummarySection(text: string): boolean {
+  return text.split('\n').some((line) => SUMMARY_HEADINGS.includes(line.trim()));
 }

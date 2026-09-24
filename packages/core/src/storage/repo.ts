@@ -215,6 +215,15 @@ export class Storage {
     this.db.update(schema.messagesTable).set({ parts: JSON.stringify(parts) }).where(eq(schema.messagesTable.id, id)).run();
   }
 
+  /** 仅更新 usage 列（逐轮 finish 时落本轮真实 usage：压缩锚点 + 上下文占用共同口径） */
+  updateMessageTokens(id: string, tokens: Usage): void {
+    this.db
+      .update(schema.messagesTable)
+      .set({ tokens: JSON.stringify(tokens), cost: tokens.cost ?? null })
+      .where(eq(schema.messagesTable.id, id))
+      .run();
+  }
+
   finalizeMessage(id: string, msg: ChatMessage): void {
     this.db
       .update(schema.messagesTable)

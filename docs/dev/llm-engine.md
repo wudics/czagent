@@ -58,7 +58,7 @@ type LLMEvent =
   | { type: 'error'; error: LLMError }
 ```
 
-协议层加固（openai-stream.ts）：任意 finish_reason（含无 choices 的纯 usage 终帧）都 flush 已聚合的工具调用（部分平台 stop 携带 tool_calls）；工具名规范化（剥 `functions.` 前缀与 `:N` 后缀）；缺 id 补生成保证 call/result 配对。
+协议层加固（openai-stream.ts）：任意 finish_reason（含无 choices 的纯 usage 终帧）都 flush 已聚合的工具调用（部分平台 stop 携带 tool_calls）；工具名规范化（剥 `functions.` 前缀与 `:N` 后缀）；缺 id 补生成保证 call/result 配对；**finish_reason 帧若无内联 usage，宽限期（≤1.2s / 16 帧）读取其后的独立 usage 尾帧并合并发射（OpenAI 标准把 usage 放在 finish 之后的空 choices 帧；全程无 usage 保持 `usage: undefined` 由会话层字符估算兜底）**。
 
 （`text/reasoning start/end`、`step-start/finish` 等由会话层在消费引擎事件时派生，引擎只报增量与终点。）
 
@@ -88,8 +88,8 @@ type LLMEvent =
 
 - 帧：`data: {json}`，以 `data: [DONE]` 结束；`choices[0].delta.content/reasoning` 字段增量。
 - 工具调用：`tool_calls[].index` 作流内 key，`id/name` 首个 delta 出现，参数按 delta 累积；finish_reason 到达统一 emit（空工具名或非法 JSON 参数降级为文本输出，缺 id 补 `call-N`）。
-- finish 即断流并 cancel body（部分平台发完 finish 不关流）。
-- usage：末尾 `usage` 块归一化（§7）。
+- finish 即统一发射（flush 工具调用后）一条 `finish` 事件：拿 usage（内联或宽限尾帧）后 cancel body 断流——防部分平台发完不关流挂起，又不再丢失 finish 后的 usage 尾帧。
+- usage：末尾 `usage` 块归一化（§7）；全程无 usage → `finish.usage=undefined`，会话层该轮走字符估算兜底。
 
 ### 4.3 重试 / 超时 / 错误分类
 
@@ -123,7 +123,8 @@ reasoningTokens ≤ outputTokens
 ```
 
 - OpenAI 系：`prompt_tokens`（含 cached）→input；`prompt_tokens_details.cached_tokens`→cacheRead；`completion_tokens(_details.reasoning_tokens)`→output/reasoning；DeepSeek 的 `prompt_cache_hit_tokens` 同样映射 cacheRead。
-- 计费：按模型 cost 配置分项累加 `session_usage`（逐轮落库，见 data-model.md §2.3）。
+- **上下文占用折算 `usageTotal = inputTokens + outputTokens`**（compaction.ts）：input 已含 cache 读写、output 已含 reasoning，子集字段是明细不是加数——相加会虚高 2~3 倍（压缩触发/仪表偏差根因）；reasoning/cache 分解字段仅供"其中…"展示。
+- 计费：按模型 cost 配置分项累加 `session_usage`（逐轮落库，见 data-model.md §2.3）；主循环每轮 finish、以及压缩摘要/自动标题/图片理解三类旁路调用均记行。
 
 ## 8. 多模态引擎（已实现）
 

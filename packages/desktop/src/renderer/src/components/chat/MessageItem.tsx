@@ -1,9 +1,32 @@
 import { memo } from 'react';
-import type { ChatMessage } from '@czagent/core';
+import type { ChatMessage, MessagePart } from '@czagent/core';
 import { useSessionsStore } from '../../stores/sessions';
 import { useChatStore } from '../../stores/chat';
 import { cn } from '../../lib/utils';
 import { MessagePartView } from './MessagePartView';
+
+type ResultPart = Extract<MessagePart, { type: 'tool-result' }>;
+
+/** tool-call/result 合并渲染：result 配进所属调用卡展开区；同 callID 多结果取配对的最新；孤儿 result 独立兜底 */
+function toRenderItems(parts: MessagePart[]): { part: MessagePart; result?: ResultPart }[] {
+  const resultByCall = new Map<string, ResultPart>();
+  parts.forEach((p) => {
+    if (p.type === 'tool-result') resultByCall.set(p.callID, p);
+  });
+  const consumed = new Set<ResultPart>();
+  parts.forEach((p) => {
+    if (p.type === 'tool-call') {
+      const r = resultByCall.get(p.callID);
+      if (r) consumed.add(r);
+    }
+  });
+  const items: { part: MessagePart; result?: ResultPart }[] = [];
+  for (const p of parts) {
+    if (p.type === 'tool-result' && consumed.has(p)) continue;
+    items.push({ part: p, result: p.type === 'tool-call' ? resultByCall.get(p.callID) : undefined });
+  }
+  return items;
+}
 
 function AssistantAvatar() {
   return (
@@ -71,7 +94,9 @@ function MessageItemInner({ message }: { message: ChatMessage }) {
         </div>
       ) : (
         <div className="min-w-0 flex-1 space-y-2.5">
-          {message.parts.map((p, i) => (p ? <MessagePartView key={i} part={p} compacting={compacting} /> : null))}
+          {toRenderItems(message.parts).map((it, i) =>
+            it.part ? <MessagePartView key={i} part={it.part} result={it.result} compacting={compacting} /> : null,
+          )}
         </div>
       )}
     </div>

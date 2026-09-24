@@ -45,6 +45,43 @@ type FinishEvent = Extract<LLMEvent, { type: 'finish' }>;
 type ToolStartEvent = Extract<LLMEvent, { type: 'tool-call-start' }>;
 
 describe('consumeOpenAiStream（loop 加固）', () => {
+  it('OpenAI 标准顺序：finish_reason 帧之后独立 usage 尾帧被捕获（token 统计不失真根因）', async () => {
+    const res = sseResponse([
+      { choices: [{ index: 0, delta: { content: '你好' } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+      { choices: [], usage: { prompt_tokens: 1200, completion_tokens: 34, prompt_tokens_details: { cached_tokens: 1000 }, completion_tokens_details: { reasoning_tokens: 10 } } },
+    ]);
+    const events = await collect(res);
+    const finishes = events.filter((e): e is FinishEvent => e.type === 'finish');
+    // 尾帧合并发射：仅一条 finish，且携带真实 usage（不再静默丢弃）
+    expect(finishes).toHaveLength(1);
+    expect(finishes[0]!.finishReason).toBe('stop');
+    expect(finishes[0]!.usage?.inputTokens).toBe(1200);
+    expect(finishes[0]!.usage?.outputTokens).toBe(34);
+    expect(finishes[0]!.usage?.cacheReadTokens).toBe(1000);
+  });
+
+  it('finish 帧自带 usage 立即返回（无宽限期等待）', async () => {
+    const res = sseResponse([
+      { choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 7, completion_tokens: 2 } },
+    ]);
+    const started = Date.now();
+    const events = await collect(res);
+    const finish = events.filter((e): e is FinishEvent => e.type === 'finish')[0]!;
+    expect(finish.usage!.inputTokens).toBe(7);
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+
+  it('全程无 usage：仅一条 finish 且 usage 为 undefined（调用方走字符估算兜底）', async () => {
+    const res = sseResponse([
+      { choices: [{ index: 0, delta: { content: 'x' }, finish_reason: 'stop' }] },
+    ]);
+    const events = await collect(res);
+    const finishes = events.filter((e): e is FinishEvent => e.type === 'finish');
+    expect(finishes).toHaveLength(1);
+    expect(finishes[0]!.usage).toBeUndefined();
+  });
+
   it('finish_reason=stop 仍 flush 已聚合的工具调用（部分平台 stop 携带 tool_calls）', async () => {
     const res = sseResponse([
       toolDelta(0, { id: 'call-1', name: 'bash', args: '{"command":' }),

@@ -74,7 +74,42 @@ export async function openAiChatFetch(b: ChatBinding, req: ChatReq, opts: OpenAi
   return fetchJsonWithRetry(`${b.baseUrl}${OPENAI_CHAT_PATH}`, body, b.apiKey, req.signal);
 }
 
-/** 消费 OpenAI 兼容 SSE 流 → LLMEvent（tool-call 增量聚合、usage 归一化、finish 即断流） */
+/** finish 之后等待独立 usage 尾帧的总宽限（毫秒；尾帧通常在 finish 同握手内即刻到达，[DONE]/关流即时结束） */
+const USAGE_TAIL_GRACE_MS = 1_200;
+const USAGE_TAIL_MAX_FRAMES = 16;
+
+/**
+ * finish_reason 帧之后的宽限读：OpenAI 兼容协议（含 stream_options.include_usage）把
+ * usage 放在 finish 帧之后的独立空 choices 帧里；部分平台发完 finish 不关流，故用总超时钳制。
+ * 拿到 usage 返回原始对象，否则超时/流结束返回 undefined。
+ */
+async function readUsageTail(sse: AsyncGenerator<string>): Promise<Record<string, unknown> | undefined> {
+  const deadline = Date.now() + USAGE_TAIL_GRACE_MS;
+  for (let i = 0; i < USAGE_TAIL_MAX_FRAMES; i++) {
+    const remain = deadline - Date.now();
+    if (remain <= 0) return undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const step = await Promise.race([
+      sse.next().catch(() => ({ done: true, value: undefined as unknown as string })),
+      new Promise<IteratorResult<string>>((resolve) => {
+        timer = setTimeout(() => resolve({ done: true, value: undefined as unknown as string }), remain);
+      }),
+    ]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+    if (step.done) return undefined;
+    let chunk: Record<string, any>;
+    try {
+      chunk = JSON.parse(step.value) as Record<string, any>;
+    } catch {
+      continue;
+    }
+    if (chunk?.usage && typeof chunk.usage === 'object') return chunk.usage as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+/** 消费 OpenAI 兼容 SSE 流 → LLMEvent（tool-call 增量聚合、usage 归一化、finish 后取尾帧再断流） */
 export async function* consumeOpenAiStream(res: Response, signal: AbortSignal | undefined, reasoningField = 'reasoning_content'): AsyncGenerator<LLMEvent> {
   if (!res.body) throw new LLMError('network', '响应无 body', {});
 
@@ -116,7 +151,11 @@ export async function* consumeOpenAiStream(res: Response, signal: AbortSignal | 
         yield { type: 'tool-call', callID, tool: name, input, ...(parseError ? { parseError } : {}) };
       }
     };
-    for await (const data of parseSse(res.body, signal)) {
+    const sse = parseSse(res.body, signal);
+    for (;;) {
+      const step = await sse.next();
+      if (step.done) break;
+      const data = step.value;
       let chunk: Record<string, any>;
       try {
         chunk = JSON.parse(data) as Record<string, any>;
@@ -157,18 +196,22 @@ export async function* consumeOpenAiStream(res: Response, signal: AbortSignal | 
           // 在流出 tool_calls 增量后回 finish_reason=stop，只认 tool_calls 会把调用静默丢弃，
           // 导致 loop 误以为无工具可执行而终止（对齐 opencode：stop+有工具调用也要继续）
           yield* flushPendingTools();
+          const inlineUsage = chunk?.usage;
+          const tailUsage = inlineUsage ? undefined : await readUsageTail(sse);
+          const finalUsage = inlineUsage ?? tailUsage;
           yield {
             type: 'finish',
             finishReason: choice.finish_reason,
-            usage: chunk?.usage ? normalizeUsage(chunk.usage) : undefined,
+            // 全程无 usage 时保持 undefined（调用方据此走字符估算兜底）
+            usage: finalUsage ? normalizeUsage(finalUsage as Record<string, unknown>) : undefined,
           };
-          // 一轮 LLM 的逻辑终点就是 finish：立即停止消费流，
+          // 一轮 LLM 的逻辑终点就是 finish：拿到（或宽限内确认没有）usage 后立即停止消费流，
           // 避免部分平台（如 siliconflow 托管模型）发完 tool_calls/finish 后流不关闭导致挂起
           cancelBody();
           return;
         }
       } else if (chunk?.usage) {
-        // 无 choices 的纯 usage 终帧：同样 flush（部分平台以此收尾且此前无 finish_reason）
+        // 无 choices 的纯 usage 终帧（部分平台无 finish_reason 直接以此收尾）：同样 flush
         yield* flushPendingTools();
         yield { type: 'finish', finishReason: 'stop', usage: normalizeUsage(chunk.usage) };
         cancelBody();

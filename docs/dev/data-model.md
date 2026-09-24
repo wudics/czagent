@@ -46,6 +46,8 @@
 
 > 借鉴 opencode：消息的 body 以 **parts**（增量持久化的 part 数组）存储，文本/推理/工具调用/工具结果都是 part，流式过程不断追加，UI 以 part 为渲染单位。
 
+每条 assistant 消息的 `tokens` 在**每轮 LLM finish 时写入该轮真实 usage**（`updateMessageTokens`，非只写收尾消息）——作为上下文占用与压缩判定的"锚点+增量"口径的数据源（agent-loop.md §5.2）。
+
 ### 2.3 `session_usage` token 统计表（决策：单会话总 token）
 
 | 列 | 类型 | 说明 |
@@ -61,9 +63,9 @@
 | cost | REAL | |
 | counted_at | INTEGER | 记账时间 |
 
-**统计口径**：每次 LLM 请求（step-finish）由协议层归一化 usage 后逐轮落一行（主循环经 `reportUsage` 落库并即时广播，不等整轮结束；provider 未回传 usage 时由 finalize 阶段字符估算兜底一行）；**单个会话总 token = `SUM(...)` where session_id=**，即"多次对话总消耗"。UI 展示累计值，并随每次请求实时刷新。
+**统计口径**：每次 LLM 请求（step-finish）由协议层归一化 usage 后逐轮落一行（主循环经 `reportUsage` 落库并即时广播，不等整轮结束；provider 未回传 usage 时由 finalize 阶段字符估算兜底一行）；**压缩摘要、自动标题、图片理解三类旁路 LLM 调用同样记行**（model_id 记实际调用模型，成本不再"隐身"）；**单个会话总 token = `SUM(...)` where session_id=**，即"多次对话总消耗"。UI 展示累计值，并随每次请求实时刷新。
 
-> 契约参考 `packages/llm/src/schema/events.ts`：总量字段是"含缓存含 reasoning 的总口径"（`input = nonCached + cacheRead + cacheWrite`），各分解字段独立存储，消费端不需要做减法。
+> 字段语义（OpenAI 系 provider 直存，不做减法拆分）：`input_tokens = prompt_tokens`（**含**缓存读写）、`output_tokens = completion_tokens`（**含** `reasoning_tokens`）。因此**上下文占用/压缩折算一律用 `usageTotal = input + output`**（compaction.ts），reasoning/cacheRead/cacheWrite 仅作"其中…"明细展示——把它们当加数相加会在高缓存命中时虚高 2~3 倍（历史上导致占比 33% 即触发压缩）。opencode 的互斥五字段（nonCached/cache/input）全加之与本式数值等价。
 
 ### 2.4 模型配置（config.json，非 sqlite；决策 5 修订）
 

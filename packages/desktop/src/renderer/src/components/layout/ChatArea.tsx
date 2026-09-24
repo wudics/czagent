@@ -31,9 +31,17 @@ export function ChatArea() {
   const followingRef = useRef(true);
   // 进入会话的强制钉底阶段：位置漂移不参与解钉判定，仅滚轮/触屏手势可打断
   const enteringRef = useRef(false);
+  // 解钉后新到达的消息计数（回底按钮徽标）：跟随恢复/会话切换清零
+  const [newCount, setNewCount] = useState(0);
+  // 上一 scroll 事件的 scrollTop：方向判定的唯一依据（对齐 opencode 意图驱动跟随）
+  const lastTopRef = useRef(0);
+  // 预载锚定回跳（scrollToIndex 使 scrollTop 变小）不是用户上滚意图：豁免一次
+  const anchorTxRef = useRef(false);
   const setPinned = (v: boolean): void => {
+    if (v === followingRef.current) return;
     followingRef.current = v;
     setFollowing(v);
+    if (v) setNewCount(0);
   };
   const prevStartRef = useRef<number | null>(null);
 
@@ -54,8 +62,12 @@ export function ChatArea() {
   const items = virtualizer.getVirtualItems();
   const totalSize = virtualizer.getTotalSize();
 
-  // 切换会话 → 打开并回到底部；无激活会话（如删除最后一个）→ 清空回到空状态
+  // 会话切换：重置跟随相关全部游标（计数/方向/锚定豁免），随后进入强制钉底阶段
   useEffect(() => {
+    lastTopRef.current = 0;
+    seenLenRef.current = 0;
+    setNewCount(0);
+    anchorTxRef.current = false;
     if (activeId) {
       setPinned(true);
       // 开始进入阶段：强制钉底直至高度稳定（轮询结束/手势打断时退出）
@@ -65,7 +77,18 @@ export function ChatArea() {
       enteringRef.current = false;
       useChatStore.getState().reset();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId]);
+
+  // 解钉期间新到达的消息计数（下拉销毁产生的负增量不计）
+  const seenLenRef = useRef(0);
+  useEffect(() => {
+    const delta = messages.length - seenLenRef.current;
+    seenLenRef.current = messages.length;
+    if (following) return;
+    if (delta > 0) setNewCount((n) => n + delta);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages.length, following]);
 
   // 跟随底部（仅在 following 时）：进入阶段用绝对拉底（不依赖虚拟列表的尺寸快照，
   // 避免 stale offset 落点偏短触发"距底>150px"误判），其余场景用 scrollToIndex 处理动态测量后的布局
@@ -147,12 +170,13 @@ export function ChatArea() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [items[0]?.index, hasMoreTop, droppedCount, loadingTop]);
 
-  // 加载完成后锚定原位置（概念索引稳定，位移补偿）
+  // 加载完成后锚定原位置（概念索引稳定，位移补偿）；程序性回跳，豁免一次方向解钉
   useEffect(() => {
     if (lastTopShift > 0 && prevStartRef.current !== null) {
       const target = prevStartRef.current + lastTopShift;
       prevStartRef.current = null;
       useChatStore.setState({ lastTopShift: 0 });
+      anchorTxRef.current = true;
       virtualizer.scrollToIndex(target, { align: 'start' });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -161,10 +185,23 @@ export function ChatArea() {
   const handleScroll = (): void => {
     const el = scrollRef.current;
     if (!el) return;
+    const prevTop = lastTopRef.current;
+    lastTopRef.current = el.scrollTop;
     // 进入阶段：强制钉底，位置漂移不参与解钉判定（手势在 wheel/touch 处理器中打断）
     if (enteringRef.current) return;
-    const near = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
-    setPinned(near);
+    // 预载锚定回跳：豁免一次方向判定（程序性位移，不是用户意图）
+    if (anchorTxRef.current) {
+      anchorTxRef.current = false;
+      return;
+    }
+    const dy = el.scrollTop - prevTop;
+    const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const near = gap < NEAR_BOTTOM_PX;
+    // 意图驱动跟随：任何上移=阅读历史意图立即解钉（覆盖滚轮/拖拽/键盘 PageUp 全部来源），
+    // 近底且下移才恢复吸附——纯距离阈值 setPinned(near) 会在"底部 150px 内慢滚阅读"时被拉锯打回；
+    // 流式间隙的 scrollTop 增长事件不会误判解钉（上移才解钉，下移/静止保持）
+    if (dy < -1 && followingRef.current) setPinned(false);
+    else if (dy > 1 && near && !followingRef.current) setPinned(true);
     if (!near) {
       // 向下滚动远离顶部时释放资源（决策 14：向下滚动释放资源）
       const first = virtualizer.getVirtualItems()[0];
@@ -187,6 +224,7 @@ export function ChatArea() {
             }
             st.dropOldest(drop);
             el.scrollTop = Math.max(0, el.scrollTop - delta);
+            lastTopRef.current = el.scrollTop;
           }
         }
       }
@@ -195,8 +233,9 @@ export function ChatArea() {
 
   // 意图判钉：向上滚动手势（滚轮 deltaY<0 / 触屏手指下滑）立即解除跟随（含打断进入阶段的强制钉底）。
   // 不依赖"距底>150px"的位置阈值——流式输出每次拉底都会清零距离，慢滚永远追不出阈值（拉锯竞态）。
+  // 卡内 data-scrollable 区域（工具输出/思考正文）的滚动是阅读内容，不构成历史浏览意图（opencode touchNested 同款豁免）。
   const handleWheel = (e: React.WheelEvent): void => {
-    if (e.deltaY < 0 && followingRef.current) {
+    if (e.deltaY < 0 && followingRef.current && !(e.target as HTMLElement | null)?.closest('[data-scrollable]')) {
       enteringRef.current = false;
       setPinned(false);
     }
@@ -206,6 +245,7 @@ export function ChatArea() {
     touchYRef.current = e.touches[0]?.clientY ?? null;
   };
   const handleTouchMove = (e: React.TouchEvent): void => {
+    if ((e.target as HTMLElement | null)?.closest('[data-scrollable]')) return;
     const y = e.touches[0]?.clientY;
     if (y == null || touchYRef.current == null) return;
     if (y > touchYRef.current && followingRef.current) {
@@ -265,7 +305,7 @@ export function ChatArea() {
         )}
       </div>
 
-      {!following && <ScrollBottomButton onClick={jumpToBottom} />}
+      {!following && <ScrollBottomButton onClick={jumpToBottom} count={newCount} />}
       <StatusBanner />
       <PermissionCard />
       <QuestionCard />

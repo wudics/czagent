@@ -18,6 +18,7 @@ import type {
   PermissionRule,
   SendMessageInput,
   SessionContext,
+  ThinkingMode,
   SessionEvent,
   SessionMeta,
   SessionPatch,
@@ -43,7 +44,22 @@ import type { ScriptAgentRunOptions, ScriptUseOverrides } from '../script/types.
 import { checkPermission, classifyBashCommand, extractTargetPath, pathInside, resolvePath } from '../permission/index.js';
 import { patchFilePaths } from '../tools/patch.js';
 import { attachmentKind, imageToDataUrl, parseAttachmentToText, textToMessagePart } from './attachments.js';
-import { estimateRequestTokens, estimateToolsTokens, pruneHistory, selectTailStart, tailBudget, truncateToolOutput, usageTotal } from '../compaction.js';
+import {
+  buildSummaryInstruction,
+  estimateContextUsed,
+  estimateRequestTokens,
+  estimateTokens,
+  estimateToolsTokens,
+  findLastCompactionIndex,
+  hasSummarySection,
+  HISTORY_WINDOW_MESSAGES,
+  pruneHistory,
+  SATURATION_COMPACT_RATIO,
+  selectTailStart,
+  SUMMARY_REMINDER,
+  tailBudget,
+  truncateToolOutput,
+} from '../compaction.js';
 import { appendTurnReminder, buildTurnReminder } from '../reminders.js';
 import { loadProjectInstructions, renderProjectInstructions, type InstructionsCacheEntry } from '../instructions.js';
 import { composeSystemPrompt, SUB_AGENT_ADDENDUM } from '../settings-defaults.js';
@@ -68,15 +84,6 @@ function stripThinkTags(text: string): string {
 /** 联网开关（I16）：webAccess=false 的会话禁用的工具（主循环与子代理共用） */
 function webAccessDisabled(meta: SessionMeta | undefined): Set<string> {
   return meta?.webAccess === false ? new Set(['webfetch', 'websearch']) : new Set<string>();
-}
-
-/** 最近一条带 tokens 的 assistant 消息折算（持久化，跨 sendMessage 有效；上下文占用的真实口径之一） */
-function lastUsageTokens(history: ChatMessage[]): number {
-  for (let i = history.length - 1; i >= 0; i--) {
-    const m = history[i]!;
-    if (m.role === 'assistant' && m.tokens) return usageTotal(m.tokens);
-  }
-  return 0;
 }
 
 /** MCP 工具清单 → 注入 env 的说明块（与工具注入同源，保证上下文估算与请求一致） */
@@ -392,6 +399,8 @@ export class SessionManager implements AgentProvider {
       let text = '';
       for await (const ev of stream) {
         if (ev.type === 'text-delta') text += ev.text;
+        // 图片描述调用产生的真实成本计入会话（旁路 LLM 不可"隐身"）
+        if (ev.type === 'finish' && ev.usage) this.reportUsage(sessionId, target.modelId, ev.usage);
       }
       const trimmed = text.trim();
       return trimmed ? `${trimmed}` : null;
@@ -415,10 +424,7 @@ export class SessionManager implements AgentProvider {
 
   /** 最后一个 compaction checkpoint 在消息数组中的下标；无则 -1 */
   private lastCompactionIndex(messages: ChatMessage[]): number {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i]!.parts.some((p) => p.type === 'compaction')) return i;
-    }
-    return -1;
+    return findLastCompactionIndex(messages);
   }
 
   /**
@@ -427,10 +433,11 @@ export class SessionManager implements AgentProvider {
    * 摘要 + coversBefore 之后的原文（保留尾部 + 新消息，时间序）进请求，更早历史跳过。
    * 旧格式（无 coversBefore）回退按消息定位切窗。多个 checkpoint 以最后一个为准
    * （更早的已被合并进最新摘要，且其 createdAt <= 最新边界，天然被过滤）。
-   * saturated = 窗口内看不到 checkpoint 且页外还有更早消息（>300 条，触发强制压缩）。
+   * saturated = 加载窗口被条数上限截断（窗内无 checkpoint 且页外还有更早消息）：
+   * 是否真的压缩由调用方按占用比例门槛裁决（低占比不再仅因条数全窗压缩）。
    */
   private historyWindow(sessionId: string): { messages: ChatMessage[]; saturated: boolean } {
-    const page = this.opts.db.storage.pageMessages(sessionId, undefined, 300);
+    const page = this.opts.db.storage.pageMessages(sessionId, undefined, HISTORY_WINDOW_MESSAGES);
     const idx = this.lastCompactionIndex(page.messages);
     if (idx < 0) return { messages: page.messages, saturated: page.hasMore };
     const checkpoint = page.messages[idx]!;
@@ -456,10 +463,12 @@ export class SessionManager implements AgentProvider {
     /** 已 prune 的请求窗口 */
     history: ChatMessage[];
     usable: number;
+    /** 摘要调用的思考模式（跟随会话；强制 off 会让 thinking-only 供应商空正文） */
+    thinking: ThinkingMode;
     checkpointId?: string;
     onSummaryDelta?: (text: string) => void;
   }): Promise<{ compacted: boolean; error?: string }> {
-    const { sessionId, settings, target, signal, history, usable, checkpointId, onSummaryDelta } = opts;
+    const { sessionId, settings, target, signal, history, usable, thinking, checkpointId, onSummaryDelta } = opts;
     // headIdx 跳过已有的摘要 checkpoint；其摘要文本并入新一次 summarize（避免二次压缩丢失旧摘要）
     const headIdx = this.lastCompactionIndex(history) === 0 ? 1 : 0;
     const previousSummary =
@@ -474,7 +483,7 @@ export class SessionManager implements AgentProvider {
     const tailStart = selectTailStart(history, headIdx, budget);
     const old = history.slice(headIdx, tailStart);
     if (old.length === 0) return { compacted: false };
-    const { summary, error } = await this.summarize(settings, target, old, signal, previousSummary, onSummaryDelta);
+    const { summary, error } = await this.summarize(sessionId, settings, target, old, signal, thinking, previousSummary, onSummaryDelta);
     if (!summary) return { compacted: false, error: error ?? '摘要生成失败' };
 
     // 会话可能已被删除（删除会话会中止压缩）：落库前复核，避免孤儿 checkpoint
@@ -511,6 +520,8 @@ export class SessionManager implements AgentProvider {
     /** 已 prune 的请求窗口 */
     history: ChatMessage[];
     usable: number;
+    /** 摘要调用的思考模式（跟随会话；见 summarizeOnce 空正文兜底） */
+    thinking: ThinkingMode;
   }): Promise<{ compacted: boolean; error?: string }> {
     const { sessionId, signal: externalSignal } = opts;
     if (this.compactingSessions.has(sessionId)) return { compacted: false, error: COMPACTION_BUSY };
@@ -536,6 +547,7 @@ export class SessionManager implements AgentProvider {
         signal: controller.signal,
         history: opts.history,
         usable: opts.usable,
+        thinking: opts.thinking,
         checkpointId: messageId,
         onSummaryDelta: emitPlaceholder,
       });
@@ -567,15 +579,17 @@ export class SessionManager implements AgentProvider {
   }
 
   /**
-   * 用摘要模型（compaction.modelId 可选，缺省会话模型）把旧消息总结为一段文本。
-   * 加固（对齐 opencode）：图片剥占位、工具输出截 2k、请求总预算上限——超限按消息粒度分块
-   * 顺序摘要并用 previousSummary 逐块合并；瞬态错误（限流/网络/服务异常）重试 1 次。
+   * 用摘要模型（compaction.modelId 可选，缺省会话模型）把旧消息总结为结构化摘要。
+   * 图片剥占位、工具输出截 2k、请求总预算上限——超限按消息粒度分块顺序摘要，
+   * previousSummary（既有摘要）逐块并入新摘要（见 buildSummaryInstruction 的合并指令）。
    */
   private async summarize(
+    sessionId: string,
     settings: Settings,
     fallbackTarget: ResolvedChat,
     history: ChatMessage[],
     signal: AbortSignal,
+    thinking: ThinkingMode,
     previousSummary?: string,
     onSummaryDelta?: (text: string) => void,
   ): Promise<{ summary?: string; error?: string }> {
@@ -603,7 +617,7 @@ export class SessionManager implements AgentProvider {
     if (cur.length > 0) chunks.push(cur);
     let merged = previousSummary;
     for (const chunk of chunks) {
-      const res = await this.summarizeOnce(target, chunk, merged, signal, (partial) => {
+      const res = await this.summarizeOnce(sessionId, target, chunk, thinking, merged, signal, (partial) => {
         // 流式回调携带"已合并摘要 + 当前块增量"，多块场景占位块持续增长不回退
         onSummaryDelta?.((merged ? `${merged}\n\n` : '') + partial);
       });
@@ -613,51 +627,81 @@ export class SessionManager implements AgentProvider {
     return merged ? { summary: merged } : { error: '模型未返回摘要内容' };
   }
 
-  /** 单次摘要调用（瞬态错误重试 1 次；onDelta 随流式增长回调，重试时从空文本重推） */
+  /**
+   * 单次摘要请求（对齐 opencode compaction 规则）：
+   * - 摘要指令恒为请求的最后一条 user 消息（含模板），不再放 system、不依赖历史里有 user 轮
+   *   ——修复 vLLM 系后端 "No user query found in messages" 400；
+   * - 输出预算用模型 maxOutput（钳 ≤32k），不再缩到 2048（thinking 模型思考+成文都要预算）；
+   * - hasSummarySection 结构校验：有正文但不合模板 → 同消息 + 追问 user 再发一次（每轮 ≤2 请求）；
+   * - 正文为空 → 末位用 reasoning 兜底（有意宽于 opencode，救只吐思考的端点）；
+   * - finish=length 即失败不重试（预算已是模型上限）；auth/invalid（retryable=false）不重烧；
+   * - 每个请求的 usage 各自入账会话。
+   */
   private async summarizeOnce(
+    sessionId: string,
     target: ResolvedChat,
     chunk: ChatMessage[],
+    thinking: ThinkingMode,
     previousSummary: string | undefined,
     signal: AbortSignal,
     onDelta?: (text: string) => void,
   ): Promise<{ summary?: string; error?: string }> {
-    const run = async (): Promise<{ summary?: string; error?: string; retryable?: boolean }> => {
+    const historyMessages = buildRequestMessages(chunk, undefined, undefined, true, undefined, {
+      toolOutputMaxChars: SUMMARY_TOOL_OUTPUT_CHARS,
+    });
+    const instruction = buildSummaryInstruction(previousSummary);
+    const maxTokens = Math.min(target.maxOutput > 0 ? target.maxOutput : 8_192, 32_000);
+    const sendOnce = async (
+      reminder: boolean,
+    ): Promise<{ text: string; reasoning: string; finishReason?: string; err?: { message: string; retryable?: boolean } }> => {
       try {
-        const system =
-          '请阅读下面的对话历史，用简洁的中文写一段总结。必须保留：已得出的结论、做出的决定、重要文件/附件的名称与路径、与图片相关的内容、尚未完成的事项。不要编造历史中未出现的信息。' +
-          (previousSummary ? `\n\n此前已有一份摘要如下，请合并其内容并去重（保留仍为真的细节、去除过时细节、并入新事实）：\n${previousSummary}` : '') +
-          `\n\n请按以下 Markdown 小节输出（无内容的小节省略）：\n## 任务目标与背景\n## 已完成与关键结论\n## 重要文件与路径\n## 用户偏好与约束\n## 未完成事项与下一步`;
-        const request: ChatReq = {
-          messages: [
-            { role: 'system', content: system },
-            ...buildRequestMessages(chunk, undefined, undefined, true, undefined, { toolOutputMaxChars: SUMMARY_TOOL_OUTPUT_CHARS }),
-          ],
-          thinking: 'off',
-          maxTokens: 2048,
-          signal,
-        };
+        const messages: LLMChatMessage[] = reminder
+          ? [...historyMessages, { role: 'user', content: instruction }, { role: 'user', content: SUMMARY_REMINDER }]
+          : [...historyMessages, { role: 'user', content: instruction }];
+        const request: ChatReq = { messages, thinking, maxTokens, signal };
         const stream = this.engineFor(target).stream(target.binding, request);
         let text = '';
+        let reasoning = '';
+        let usage: Usage | undefined;
+        let finishReason: string | undefined;
         for await (const ev of stream) {
           if (ev.type === 'text-delta') {
             text += ev.text;
             onDelta?.(text);
+          } else if (ev.type === 'reasoning-delta') {
+            reasoning += ev.text;
+          } else if (ev.type === 'finish') {
+            if (ev.usage) usage = ev.usage;
+            finishReason = ev.finishReason;
           }
         }
-        const trimmed = text.trim();
-        return trimmed ? { summary: trimmed } : { error: '模型未返回摘要内容' };
+        if (usage) this.reportUsage(sessionId, target.modelId, usage);
+        return { text, reasoning, finishReason };
       } catch (err) {
         const e = err instanceof LLMError ? err : new LLMError('unknown', String((err as Error)?.message ?? err), {});
-        return { error: friendlyLLMMessage(e), retryable: e.retryable };
+        return { text: '', reasoning: '', err: { message: friendlyLLMMessage(e), retryable: e.retryable } };
       }
     };
-    let res = await run();
-    if (!res.summary && res.retryable && !signal.aborted) {
-      onDelta?.('');
-      await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
-      res = await run();
+    let attempt = await sendOnce(false);
+    if (!signal.aborted) {
+      if (attempt.err && !attempt.text.trim() && !attempt.reasoning.trim() && attempt.err.retryable !== false) {
+        // 瞬态错误（限流/网络/流中断且无任何产出）：等 800ms 同请求重发一次
+        await new Promise<void>((resolve) => setTimeout(resolve, 800));
+        onDelta?.('');
+        attempt = await sendOnce(false);
+      } else if (!attempt.err && attempt.text.trim() && !hasSummarySection(attempt.text)) {
+        // 结构校验失败：追问重试一次（opencode 同款——不带首轮输出，仅追加提醒消息）
+        await new Promise<void>((resolve) => setTimeout(resolve, 300));
+        onDelta?.('');
+        attempt = await sendOnce(true);
+      }
     }
-    return { ...(res.summary ? { summary: res.summary } : {}), ...(res.error ? { error: res.error } : {}) };
+    const finalText = attempt.text.trim() || stripThinkTags(attempt.reasoning).trim();
+    if (finalText) return { summary: finalText };
+    if (attempt.err) return { error: attempt.err.message };
+    if (attempt.finishReason === 'length') return { error: '未返回摘要正文（输出预算耗尽 finish=length）' };
+    // 诊断带 finish 原因（tool_calls=模型试图继续任务而非写摘要）
+    return { error: `未返回摘要内容${attempt.finishReason ? `（finish=${attempt.finishReason}）` : ''}` };
   }
 
   // ---- 消息 ----
@@ -823,7 +867,7 @@ export class SessionManager implements AgentProvider {
       if (!current) throw new Error('会话不存在');
       if (current.status !== 'idle') throw new Error('会话正在运行，无法压缩');
       const history = pruneHistory(this.historyWindow(sessionId).messages);
-      const result = await this.executeCompaction({ sessionId, settings, target, history, usable });
+      const result = await this.executeCompaction({ sessionId, settings, target, history, usable, thinking: current.thinkingMode });
       if (!result.compacted && result.error) throw new Error(result.error);
       // 压缩成功 → 重算新窗口占用并推送，右侧面板百分比立即回落
       if (result.compacted) {
@@ -844,8 +888,8 @@ export class SessionManager implements AgentProvider {
 
   /**
    * 计算当前上下文占用（含 system prompt/env/MCP 说明）。
-   * 窗口含 checkpoint 时上次真实 usage 口径失效（测量自压缩前更大的窗口），用纯请求估算；
-   * 无压缩历史（全量窗口）时用 max(估算, 上次真实 usage) 兜底启发式与真实 tokenizer 的偏差。
+   * 口径与 runLoop 压缩触发完全一致（同一 estimateContextUsed = 锚点 usageTotal + 锚点后增量），
+   * 面板百分比与触发线不再有"表低实高"的偏差（历史上此不一致导致 33% 就触发压缩）。
    */
   private async computeContext(sessionId: string): Promise<SessionContext | null> {
     const session = this.opts.db.storage.getSession(sessionId);
@@ -859,8 +903,14 @@ export class SessionManager implements AgentProvider {
     const envBlock = await this.buildEnvBlock(cwd, agent, settings);
     const mcpTools = await this.mcpToolsFor(cwd, agent, new Set<string>());
     const requestMessages = buildRequestMessages(history, composeSystemPrompt(agent), envBlock + mcpNoteOf(mcpTools), visionOk(model));
-    const est = estimateRequestTokens(requestMessages);
-    const used = this.lastCompactionIndex(history) >= 0 ? est : Math.max(est, lastUsageTokens(history));
+    // 工具 schema 占用与 runLoop 同源估算（无 usage 锚点时两值才相等；有锚点时锚点已含）
+    const registry = this.opts.registry ?? createDefaultRegistry();
+    const turnDisabled = webAccessDisabled(session);
+    const enabledTools = registry
+      .list()
+      .filter((t) => !turnDisabled.has(t.id) && effectiveToolLoaded(agent, settings.permissions.default, t.id));
+    const toolsTokens = estimateToolsTokens(registry.toOpenAI(enabledTools.concat(mcpTools)));
+    const used = estimateContextUsed(history, estimateRequestTokens(requestMessages) + toolsTokens);
     return { used, limit: contextLimitOf(model) };
   }
 
@@ -1791,6 +1841,8 @@ export class SessionManager implements AgentProvider {
     let denyStopReason = '';
     // 连续"全无效工具调用"轮数（未知工具/参数解析失败）：≥3 终止并提示，防无限空转
     let invalidTurns = 0;
+    // 自动压缩 run 级熔断：失败一次即停止后续轮尝试（错误可见一次，交用户处置），防每轮反复烧失败的摘要调用
+    let autoCompactGaveUp = false;
     // 上一轮生效的 agent id（检测 plan→build 切换，供切换提醒一次性注入）
     let prevAgentId = agent?.id;
 
@@ -1831,21 +1883,27 @@ export class SessionManager implements AgentProvider {
           maxSteps,
           lastPlan: this.lastPlans.get(sessionId),
         });
-        // 上下文压缩：溢出检测（估算 ∨ 上次真实 usage）→ 摘要 checkpoint → 仍超限丢最旧重试 ≤1；
-        // contextLimit<=0 / auto=false 时跳过；工具输出持续 prune（请求侧，DB 不动）
+        // 上下文压缩：占用估算（锚点+增量，见 compaction.estimateContextUsed）→ 摘要 checkpoint →
+        // 仍超限丢最旧直到装得下；contextLimit<=0 / auto=false 时 token 触发跳过；工具输出持续 prune（请求侧，DB 不动）
         const compactUsable = this.compactionUsable(turnTarget.contextLimit, settings, turnTarget.maxOutput);
         const window0 = this.historyWindow(sessionId);
         let history = pruneHistory(window0.messages);
-        // 窗口饱和（>300 条且窗口内无可见 checkpoint）→ 即使 token 未超预算也强制压缩，避免历史被静默丢弃
-        const saturationCompact = window0.saturated && settings.general.compaction.auto;
         // 工具 schema 随请求发送并计入窗口（消息估算不含它）；请求侧统一复用同一份序列化
         const toolsSchema = canTool && tools.length > 0 ? registry.toOpenAI(tools) : undefined;
         const toolsTokens = estimateToolsTokens(toolsSchema);
+        const rebuild = (h: ChatMessage[]): number => {
+          requestMessages = buildRequestMessages(h, composeSystemPrompt(turnAgent), envBlock + mcpNote, turnTarget.vision, turnReminder);
+          return estimateContextUsed(h, estimateRequestTokens(requestMessages) + toolsTokens);
+        };
         let requestMessages = buildRequestMessages(history, composeSystemPrompt(turnAgent), envBlock + mcpNote, turnTarget.vision, turnReminder);
-        let est = Math.max(estimateRequestTokens(requestMessages) + toolsTokens, lastUsageTokens(history));
+        let est = estimateContextUsed(history, estimateRequestTokens(requestMessages) + toolsTokens);
+        // 窗口饱和（条数超加载上限且窗内无 checkpoint，再往外的历史会被静默截断）触发压缩：
+        // 需占用同时达到门槛（≥ usable×0.5；contextLimit 未知时退化为 50k）——低占比不再仅因条数全窗压缩
+        const saturationGate = compactUsable !== null ? est >= compactUsable * SATURATION_COMPACT_RATIO : est >= 50_000;
+        const saturationCompact = window0.saturated && settings.general.compaction.auto && saturationGate;
         // 需要压缩但因失败没压成的错误（自动压缩失败时插入可见 error part，不再静默）
         let autoCompactError: string | undefined;
-        if ((compactUsable !== null && est >= compactUsable) || saturationCompact) {
+        if (((compactUsable !== null && est >= compactUsable) || saturationCompact) && !autoCompactGaveUp) {
           // 统一走 executeCompaction（时间线流式显示）；单飞冲突（同会话已有压缩任务）→ 静默跳过，下轮复查
           if (!this.compactingSessions.has(sessionId)) {
             // 饱和触发的压缩不依赖 token 预算：usable 传极大值（尾部预算钳到 15k + 条数上限 200）
@@ -1856,30 +1914,32 @@ export class SessionManager implements AgentProvider {
               signal,
               history,
               usable: compactUsable ?? Number.MAX_SAFE_INTEGER,
+              thinking: turnThinking,
             });
             if (!compactResult.compacted && compactResult.error && compactResult.error !== COMPACTION_BUSY) {
               autoCompactError = compactResult.error;
+              // run 级熔断：失败一次停止后续轮尝试（错误可见一次，防每轮反复烧失败的摘要调用）
+              autoCompactGaveUp = true;
             }
           }
-          history = pruneHistory(this.historyWindow(sessionId).messages);
-          requestMessages = buildRequestMessages(history, composeSystemPrompt(turnAgent), envBlock + mcpNote, turnTarget.vision, turnReminder);
-          // 压缩后用纯估算复查：checkpoint 已存在，压缩前的旧 usage 口径失效（会误判仍超限）
-          est = estimateRequestTokens(requestMessages) + toolsTokens;
-          if (compactUsable !== null && est >= compactUsable) {
+          if (!autoCompactError) {
+            // 压缩成功（或单飞冲突跳过）：按新窗口重算占用
+            est = rebuild(pruneHistory(this.historyWindow(sessionId).messages));
+          }
+          // 仍超限（压缩失败/无摘要可压/尾部+工具超预算）：机械降级——循环丢最旧非 checkpoint 消息
+          // （保留 checkpoint 与最新两条；≤64 轮防 O(n²) 病态），本轮请求尽量合规发出；真溢出仍走下方自愈/错误终局
+          for (let guard = 0; compactUsable !== null && est >= compactUsable && guard < 64; guard++) {
             const start = this.lastCompactionIndex(history) === 0 ? 1 : 0;
-            if (start < history.length) {
-              // 丢弃最旧一条非 checkpoint 消息（保留摘要 checkpoint），仅重试一次
-              history = pruneHistory(history.slice(0, start).concat(history.slice(start + 1)));
-              requestMessages = buildRequestMessages(history, composeSystemPrompt(turnAgent), envBlock + mcpNote, turnTarget.vision, turnReminder);
-            }
+            if (history.length - start <= 2) break;
+            const dropped = history.slice(0, start).concat(history.slice(start + 1));
+            if (dropped.length === history.length) break; // 只剩 checkpoint，无可丢
+            history = dropped;
+            est = rebuild(history);
           }
         }
         prevAgentId = turnAgent?.id ?? prevAgentId;
-        // 上下文仪表：复用本轮请求估算（含 system prompt/env/MCP 说明），零额外计算；
-        // 窗口含 checkpoint 时上次真实 usage 口径失效（测量自压缩前更大的窗口），改用纯估算。
-        // 溢出检测用的 est 保持 max 混合口径，不受影响
-        const gaugeUsed = this.lastCompactionIndex(history) >= 0 ? estimateRequestTokens(requestMessages) + toolsTokens : est;
-        this.emit({ sessionId, type: 'session.context', used: gaugeUsed, limit: turnTarget.contextLimit });
+        // 上下文仪表：与触发判定同一口径（锚点 usageTotal + 增量；触发线已按 usable 预留输出预算）
+        this.emit({ sessionId, type: 'session.context', used: est, limit: turnTarget.contextLimit });
         let request: ChatReq = {
           messages: requestMessages,
           thinking: turnThinking,
@@ -1909,6 +1969,15 @@ export class SessionManager implements AgentProvider {
         // part 索引 append-only 分配：text/reasoning 槽位不再写死 0/1，流中插入 pending 工具卡不会被覆盖
         let reasoningIdx = -1;
         let textIdx = -1;
+        // 思考起止时间（渲染层折叠"已思考 · Ns"；start=首个 delta，end=首个正文/工具或流结束）
+        let reasoningStart = 0;
+        let reasoningClosed = false;
+        const closeReasoningTime = (): void => {
+          if (reasoningIdx < 0 || reasoningClosed) return;
+          reasoningClosed = true;
+          const p = parts[reasoningIdx];
+          if (p && p.type === 'reasoning') parts[reasoningIdx] = { ...p, time: { start: p.time?.start || reasoningStart || Date.now(), end: Date.now() } };
+        };
         // callID → 工具卡 part 下标（流中 start 建卡，complete 事件按 callID upsert，避免重复卡片）
         const toolPartIdx = new Map<string, number>();
         const turnToolCalls: { callID: string; tool: string; input: unknown; parseError?: string }[] = [];
@@ -1931,17 +2000,20 @@ export class SessionManager implements AgentProvider {
               switch (ev.type) {
                 case 'reasoning-delta': {
                   reasoningAcc += stripThinkTags(ev.text);
+                  if (!reasoningStart) reasoningStart = Date.now();
                   if (reasoningIdx < 0) {
                     reasoningIdx = parts.length;
-                    parts.push({ type: 'reasoning', text: reasoningAcc });
+                    parts.push({ type: 'reasoning', text: reasoningAcc, time: { start: reasoningStart } });
                   } else {
-                    parts[reasoningIdx] = { type: 'reasoning', text: reasoningAcc };
+                    const prevEnd = (parts[reasoningIdx] as Extract<MessagePart, { type: 'reasoning' }>).time?.end;
+                    parts[reasoningIdx] = { type: 'reasoning', text: reasoningAcc, time: { start: reasoningStart, ...(prevEnd ? { end: prevEnd } : {}) } };
                   }
                   emitPart(assistantId, reasoningIdx, parts[reasoningIdx]!);
                   persistPartsThrottled();
                   break;
                 }
                 case 'text-delta': {
+                  closeReasoningTime();
                   textAcc += ev.text;
                   if (textIdx < 0) {
                     textIdx = parts.length;
@@ -1954,6 +2026,7 @@ export class SessionManager implements AgentProvider {
                   break;
                 }
                 case 'tool-call-start': {
+                  closeReasoningTime();
                   // 流中即建卡（pending）：模型一开始发工具调用就立即可见，不再等整条流结束
                   if (!ev.callID || toolPartIdx.has(ev.callID)) break;
                   const idx = parts.length;
@@ -1967,6 +2040,7 @@ export class SessionManager implements AgentProvider {
                   // 参数增量不逐条广播（pending 卡已可见，参数完整时由 tool-call 一次性更新）
                   break;
                 case 'tool-call': {
+                  closeReasoningTime();
                   turnToolCalls.push({ callID: ev.callID, tool: ev.tool, input: ev.input, ...(ev.parseError ? { parseError: ev.parseError } : {}) });
                   const part: MessagePart = { type: 'tool-call', tool: ev.tool, callID: ev.callID, input: ev.input, state: 'running' };
                   const existing = toolPartIdx.get(ev.callID);
@@ -1983,8 +2057,11 @@ export class SessionManager implements AgentProvider {
                   break;
                 }
                 case 'finish':
+                  closeReasoningTime();
                   if (ev.usage) {
                     providerUsage = ev.usage;
+                    // 逐轮落库：本轮真实 usage 写到本轮 assistant 消息（压缩锚点 + 上下文占用共用此口径）
+                    storage.updateMessageTokens(assistantId, ev.usage);
                     // 逐轮落库+广播：Token 统计随每次 LLM 请求实时刷新，不再等整轮结束
                     this.reportUsage(sessionId, turnTarget.modelId, ev.usage);
                   }
@@ -2017,11 +2094,11 @@ export class SessionManager implements AgentProvider {
               signal,
               history: pruneHistory(this.historyWindow(sessionId).messages),
               usable: compactUsable ?? Number.MAX_SAFE_INTEGER,
+              thinking: turnThinking,
             });
             if (!res.compacted) break; // 无法压缩（含已在压缩中）→ 走错误终局
-            history = pruneHistory(this.historyWindow(sessionId).messages);
-            requestMessages = buildRequestMessages(history, composeSystemPrompt(turnAgent), envBlock + mcpNote, turnTarget.vision, turnReminder);
-            this.emit({ sessionId, type: 'session.context', used: estimateRequestTokens(requestMessages) + toolsTokens, limit: turnTarget.contextLimit });
+            est = rebuild(pruneHistory(this.historyWindow(sessionId).messages));
+            this.emit({ sessionId, type: 'session.context', used: est, limit: turnTarget.contextLimit });
             request = { ...request, messages: requestMessages };
           } else if (!streamError.retryable || attempt >= RETRY_MAX_ATTEMPTS) {
             break; // 不可重试（auth/quota/invalid）或重试耗尽 → 错误终局
@@ -2351,10 +2428,15 @@ export class SessionManager implements AgentProvider {
       };
       const stream = this.engineFor(target).stream(target.binding, request);
       let text = '';
+      let reasoning = '';
       for await (const ev of stream) {
         if (ev.type === 'text-delta') text += ev.text;
+        else if (ev.type === 'reasoning-delta') reasoning += ev.text;
+        // 标题调用成本入账；thinking-only 模型正文空时回退取思考流首行
+        if (ev.type === 'finish' && ev.usage) this.reportUsage(sessionId, target.modelId, ev.usage);
       }
-      const cleaned = text
+      const source = text.trim() || stripThinkTags(reasoning).split('\n')[0] || '';
+      const cleaned = source
         .trim()
         .replace(/^["'「『]+|["'」』。.]+$/g, '')
         .slice(0, 30)
@@ -2386,14 +2468,14 @@ export class SessionManager implements AgentProvider {
     const storage = this.opts.db.storage;
     const session = storage.getSession(sessionId);
     // synthetic text（如 plan 可见计划全文）非模型生成输出，不计入用量估算
-    const textLength = parts.reduce((n, p) => n + (p.type === 'text' && !p.synthetic ? p.text.length : 0), 0);
-    const reasoningLength = parts.reduce((n, p) => n + (p.type === 'reasoning' ? p.text.length : 0), 0);
+    const outText = parts.filter((p): p is Extract<MessagePart, { type: 'text' }> => p.type === 'text' && !p.synthetic).map((p) => p.text).join('');
+    const reasoningText = parts.filter((p): p is Extract<MessagePart, { type: 'reasoning' }> => p.type === 'reasoning').map((p) => p.text).join('');
     const usage: Usage =
       providerUsage ??
       ({
-        inputTokens: textLength > 0 || reasoningLength > 0 ? Math.round((textLength + reasoningLength) * 0.25) : 0,
-        outputTokens: textLength,
-        reasoningTokens: reasoningLength,
+        inputTokens: estimateTokens(outText + reasoningText),
+        outputTokens: estimateTokens(outText),
+        reasoningTokens: estimateTokens(reasoningText),
         cacheReadTokens: 0,
         cacheWriteTokens: 0,
         cost: 0,
@@ -2413,11 +2495,10 @@ export class SessionManager implements AgentProvider {
     storage.updateSessionStatus(sessionId, 'idle');
     const total = storage.getUsage(sessionId);
     if (total) this.emit({ sessionId, type: 'session.usage', usage: total });
-    // 上下文仪表：轻量口径（API input 已含 system prompt/工具定义，usageTotal 即本次请求规模）
+    // 上下文仪表：与 runLoop/computeContext 统一口径（锚点 + 增量；有本轮 provider usage 即锚定本轮，含 system/tools/前文）
     try {
-      const cfg = await this.opts.config.read();
-      const fm = cfg.chatModels.find((m) => m.id === session?.modelId) ?? cfg.multimodalModels.find((m) => m.id === session?.modelId);
-      this.emit({ sessionId, type: 'session.context', used: usageTotal(usage), limit: fm ? contextLimitOf(fm) : 0 });
+      const ctx = await this.computeContext(sessionId);
+      if (ctx) this.emit({ sessionId, type: 'session.context', ...ctx });
     } catch {
       // 上下文推送失败不影响落库
     }

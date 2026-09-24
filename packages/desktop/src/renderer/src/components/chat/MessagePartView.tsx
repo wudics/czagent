@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Sparkles, Wrench } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { ChevronRight, Sparkles, Wrench } from 'lucide-react';
 import type { MessagePart } from '@czagent/core';
 import { useTranslation } from 'react-i18next';
 import { Markdown } from '../markdown/Markdown';
@@ -16,6 +16,7 @@ function LongText({ text, className }: { text: string; className?: string }) {
   if (text.length <= COLLAPSED_PREVIEW_CHARS) {
     return (
       <pre
+        data-scrollable
         className={cn(
           'max-h-56 overflow-auto whitespace-pre-wrap wrap-anywhere rounded-md bg-muted/40 p-2 text-[12px] leading-relaxed',
           className,
@@ -41,7 +42,7 @@ function LongText({ text, className }: { text: string; className?: string }) {
   }
   return (
     <div className={cn('rounded-md bg-muted/40 p-2 text-[12px] leading-relaxed', className)}>
-      <pre className="max-h-56 overflow-auto whitespace-pre-wrap wrap-anywhere">{text}</pre>
+      <pre data-scrollable className="max-h-56 overflow-auto whitespace-pre-wrap wrap-anywhere">{text}</pre>
       <button
         type="button"
         onClick={() => setExpanded(false)}
@@ -53,22 +54,45 @@ function LongText({ text, className }: { text: string; className?: string }) {
   );
 }
 
-function reasoningLabelText(kind: 'pending' | 'done'): string {
-  return kind === 'pending' ? '思考中' : '思考';
-}
-
-export function ReasoningView({ text }: { text: string }) {
-  const done = text.length > 0;
+/**
+ * 思考过程（对齐 opencode 时间线呈现）：流式期间自动展开实时滚动（有界高度防布局跳）；
+ * 结束（time.end 落库）自动折叠为"思考 · Ns"一行；用户手动开合过则不再自动折叠。
+ */
+export function ReasoningView({ text, time }: { text: string; time?: { start: number; end?: number } }) {
+  const { t } = useTranslation();
+  const streaming = !time?.end;
+  const [open, setOpen] = useState(streaming);
+  const touched = useRef(false);
+  useEffect(() => {
+    if (!streaming && !touched.current) setOpen(false);
+  }, [streaming]);
+  const secs = time?.end && time.start ? Math.max(1, Math.round((time.end - time.start) / 1000)) : undefined;
   return (
     <div className="rounded-md border border-dashed border-border bg-muted/40 px-3 py-2">
-      <div className="mb-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-        <Sparkles size={12} className={cn(done && 'text-primary')} />
-        <span>{reasoningLabelText(done ? 'done' : 'pending')}</span>
-        {!done && <span className="h-1 w-1 animate-pulse rounded-full bg-current" />}
-      </div>
-      <div className="whitespace-pre-wrap wrap-anywhere text-[13px] leading-relaxed text-muted-foreground italic">
-        {text}
-      </div>
+      <button
+        type="button"
+        onClick={() => {
+          touched.current = true;
+          setOpen((o) => !o);
+        }}
+        className="flex w-full items-center gap-1.5 text-left text-xs text-muted-foreground"
+      >
+        <ChevronRight size={12} className={cn('shrink-0 transition-transform', open && 'rotate-90')} />
+        <Sparkles size={12} className={cn(!streaming && 'text-primary')} />
+        <span>
+          {streaming ? t('chat.reasoningLive') : t('chat.reasoningDone')}
+          {!streaming && secs != null && ` · ${t('chat.reasoningSeconds', { n: secs })}`}
+        </span>
+        {streaming && <span className="h-1 w-1 animate-pulse rounded-full bg-current" />}
+      </button>
+      {open && (
+        <div
+          data-scrollable
+          className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap wrap-anywhere text-[13px] leading-relaxed text-muted-foreground italic"
+        >
+          {text}
+        </div>
+      )}
     </div>
   );
 }
@@ -87,30 +111,67 @@ function ToolStatusBadge({ state }: { state: 'pending' | 'running' | 'completed'
   return <Badge variant="destructive">{t('chat.toolError')}</Badge>;
 }
 
-export function ToolCallView({ part }: { part: Extract<MessagePart, { type: 'tool-call' }> }) {
+/** 折叠态标题副文本：title（长任务进度）优先，否则紧凑单行入参摘要 */
+function briefArgs(input: unknown): string {
+  try {
+    const s = typeof input === 'string' ? input : JSON.stringify(input ?? {});
+    return s.length > 90 ? s.slice(0, 90) + '…' : s;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 工具卡片（对齐 opencode BasicTool）：call 与 result 合并为一张可折叠卡。
+ * 执行中默认展开（参数/进度可见），完成/失败自动折叠成一行（用户手动开合过则尊重其选择）；
+ * 历史消息挂载即完成态 → 默认折叠，减少长会话 DOM 与视觉噪音。
+ */
+export function ToolCallView({
+  part,
+  result,
+}: {
+  part: Extract<MessagePart, { type: 'tool-call' }>;
+  result?: Extract<MessagePart, { type: 'tool-result' }>;
+}) {
+  const settled = part.state === 'completed' || part.state === 'error';
+  const [open, setOpen] = useState(!settled);
+  const touched = useRef(false);
+  useEffect(() => {
+    if (settled && !touched.current) setOpen(false);
+  }, [settled]);
+  const brief = part.title ?? briefArgs(part.input);
   return (
     <div className="tool-card">
-      <div className="flex items-center gap-2">
+      <button
+        type="button"
+        onClick={() => {
+          touched.current = true;
+          setOpen((o) => !o);
+        }}
+        className="flex w-full items-center gap-2 text-left"
+      >
+        <ChevronRight size={12} className={cn('shrink-0 text-muted-foreground transition-transform', open && 'rotate-90')} />
         <Wrench size={13} className="shrink-0 text-muted-foreground" />
-        <span className="text-[13px] font-medium">{part.tool}</span>
-        {part.title && <span className="truncate text-xs text-muted-foreground">{part.title}</span>}
-        <span className="ml-auto">
+        <span className="shrink-0 text-[13px] font-medium">{part.tool}</span>
+        {brief && <span className="truncate text-xs text-muted-foreground">{brief}</span>}
+        <span className="ml-auto shrink-0">
           <ToolStatusBadge state={part.state} />
         </span>
-      </div>
-      <details className="group mt-1">
-        <summary className="cursor-pointer list-none text-[11px] text-muted-foreground transition-colors hover:text-foreground">
-          <span className="select-none">参数</span>
-        </summary>
-        <pre className="mt-1 max-h-40 overflow-auto rounded bg-muted/60 p-2 text-[11px] leading-relaxed">
-          {JSON.stringify(part.input, null, 2)}
-        </pre>
-      </details>
+      </button>
+      {open && (
+        <div className="mt-1.5 space-y-1.5">
+          <pre data-scrollable className="max-h-40 overflow-auto rounded bg-muted/60 p-2 text-[11px] leading-relaxed">
+            {JSON.stringify(part.input, null, 2)}
+          </pre>
+          {result ? <ToolResultBody part={result} /> : null}
+        </div>
+      )}
     </div>
   );
 }
 
-export function ToolResultView({ part }: { part: Extract<MessagePart, { type: 'tool-result' }> }) {
+/** 结果正文（并入工具卡展开区或孤儿结果独立渲染共用；data-scrollable 供滚轮意图豁免） */
+function ToolResultBody({ part }: { part: Extract<MessagePart, { type: 'tool-result' }> }) {
   const isErr = part.state === 'error';
   const text =
     typeof part.output === 'string' ? part.output : JSON.stringify(part.output, null, 2);
@@ -130,6 +191,11 @@ export function ToolResultView({ part }: { part: Extract<MessagePart, { type: 't
       )}
     </div>
   );
+}
+
+/** 孤儿结果（未找到所属 call 的历史/异常数据）独立渲染兜底 */
+export function ToolResultView({ part }: { part: Extract<MessagePart, { type: 'tool-result' }> }) {
+  return <ToolResultBody part={part} />;
 }
 
 export function CompactionView({ summary, streaming }: { summary: string; streaming?: boolean }) {
@@ -152,7 +218,16 @@ export function CompactionView({ summary, streaming }: { summary: string; stream
   );
 }
 
-export function MessagePartView({ part, compacting }: { part: MessagePart; compacting?: boolean }) {
+export function MessagePartView({
+  part,
+  result,
+  compacting,
+}: {
+  part: MessagePart;
+  /** tool-call 对应的 tool-result（同卡合并渲染；缺省为孤儿/占位调用，单独渲染） */
+  result?: Extract<MessagePart, { type: 'tool-result' }>;
+  compacting?: boolean;
+}) {
   switch (part.type) {
     case 'text':
       return part.text.length > LONG_TEXT_THRESHOLD ? (
@@ -161,7 +236,7 @@ export function MessagePartView({ part, compacting }: { part: MessagePart; compa
         <Markdown text={part.text} className="message-text" />
       );
     case 'reasoning':
-      return <ReasoningView text={part.text} />;
+      return <ReasoningView text={part.text} time={part.time} />;
     case 'image':
       // 助手消息流中的生成图片（富输出落库；用户附件图片在 MessageItem 内联渲染）
       return (
@@ -173,7 +248,7 @@ export function MessagePartView({ part, compacting }: { part: MessagePart; compa
         />
       );
     case 'tool-call':
-      return <ToolCallView part={part} />;
+      return <ToolCallView part={part} result={result} />;
     case 'tool-result':
       return <ToolResultView part={part} />;
     case 'error':

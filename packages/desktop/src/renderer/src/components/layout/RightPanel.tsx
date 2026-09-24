@@ -146,7 +146,8 @@ export function RightPanel() {
               </div>
               <div className="text-muted-foreground">
                 输入 {usage.inputTokens} · 输出 {usage.outputTokens}
-                {usage.reasoningTokens > 0 && ` · 思考 ${usage.reasoningTokens}`}
+                {usage.reasoningTokens > 0 && ` · 其中思考 ${usage.reasoningTokens}`}
+                {usage.cacheReadTokens > 0 && ` · 其中缓存命中 ${usage.cacheReadTokens}`}
               </div>
               {usage.cost > 0 && (
                 <div className="text-muted-foreground">

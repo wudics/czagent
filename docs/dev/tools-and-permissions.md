@@ -95,11 +95,15 @@ permission: {
   - 用户中止：kill 后正常返回部分输出 + "用户中止了命令"，`exitCode: 130`
 - **平台差异**：Windows 用 `powershell -NoProfile -NonInteractive -Command` 语义，脚本/路径分隔符差异在工具描述中说明（平台感知双分支描述）。
 
-## 5. websearch（决策 17，P2）
+## 5. websearch（决策 17，P2；048 升级 AI 检索）
 
-自研抓取国内搜索引擎，不依赖第三方搜索 API：
+AI 结构化检索优先（百度千帆 → Exa），HTML 抓取国内搜索引擎作兜底：
 
-- **引擎**：360 搜索、搜狗、国内 Bing、百度，按可用性降级（`try each → 首个返回结果`）。
+- **AI 引擎（级联，启用且 Key 非空才参与）**：
+  - `baidu-ai`：千帆 web_search API（`qianfan.baidubce.com/v2/ai_search/web_search`，Bearer API Key；query 按权截 72 字符=汉字计 2；结果取 `references[].{title,url,snippet|content}`；月免 1500 次）。
+  - `exa`：`api.exa.ai/search`（`type=auto`，`contents` 只要 summary/highlights 不要全文；结果取 `results[].{title,url,summary|highlights[0]}`）。
+  - 任一成功且非空 → 直接返回（同一相关性排序与输出格式）；未启用/HTTP 失败/空结果 → 静默降级下一档。**不参与 HTML 抓取节流**（正式 API 无防爬需求）。
+- **HTML 兜底引擎**：必应、百度、360、搜狗，按可用性降级（`try each → 首个返回结果`）。
 - **流程**：
   1. 构造各引擎搜索 URL（带 query + 翻页参数）。
   2. 抓取 HTML → 按引擎解析器提取 `[{ title, url, snippet }]`（编码容错：UTF-8/GBK 自动检测）。
@@ -107,7 +111,7 @@ permission: {
   4. **内容不足时翻页**：翻页最多 3 次，聚合去重。
   5. 对高匹配结果，agent 可用 `webfetch` 抓详情页（工具描述中引导）。
 - **风险应对**：反爬（UA、延时、频率限制 ≤1 次/2s）、解析器隔离（每引擎一个模块，结构变化只影响单引擎）、失败静默降级。
-- 配置：引擎开关、请求间隔、结果条数。
+- 配置（`general.websearch`）：AI 引擎逐条 `{ enabled, apiKey }`（设置页「权限 → 网页搜索」，开关开但缺 Key 显式提示；key 明文存本机 settings JSON，与模型 API Key 同安全级）、HTML 引擎开关、结果条数。
 
 ## 6. 工具结果回填
 

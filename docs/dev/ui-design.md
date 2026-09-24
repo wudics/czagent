@@ -68,7 +68,7 @@
 |---|---|
 | 模型 | 三区管理（2026-09 重构，I 迭代 037）：**对话模型**（每条自带接口实现 implId 下拉/baseUrl/apiKey/模型名/上下文与输出上限/toolcall/vision/参数 options，添加时预填默认地址并复用同实现 Key，保存不自动设默认）、**多模态模型**（按 capability 绑定单模型：embedding/rerank/图像/视频/语音/图像理解，实现各有针对性下拉）、**能力绑定**（8 个 capability → 模型 id，下拉按能力过滤候选，用户手动设置默认；写 config.json `chatModels`/`multimodalModels`/`bindings`） |
 | Agent | build/plan 系统提示词编辑、新建自定义 agent（提示词 + tools + permission + steps + model） |
-| 权限 | 全局默认规则、危险操作默认策略、websearch 引擎开关（P2） |
+| 权限 | 全局默认规则、危险操作默认策略、websearch 引擎开关与 AI 检索 API Key（P2/048） |
 | 通用 | 语言（中文/英文）、并发上限、压缩阈值、主题（浅/深/跟随系统） |
 
 ## 7. 状态管理（zustand）

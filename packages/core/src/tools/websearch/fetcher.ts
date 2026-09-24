@@ -37,6 +37,28 @@ function decodeHtml(buffer: ArrayBuffer, contentType: string): string {
   return new TextDecoder('utf-8').decode(buffer);
 }
 
+/**
+ * API 引擎 JSON POST（不参与 HTML 抓取节流——那是反爬约束，正式 API 无此需要）。
+ * 非 2xx / 非法 JSON 抛错（HTTP 码 + 响应体截断），由编排层静默降级。
+ */
+export async function fetchJsonPost(url: string, headers: Record<string, string>, body: unknown, signal?: AbortSignal): Promise<unknown> {
+  const timeout = AbortSignal.timeout(20_000);
+  const merged = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify(body),
+    signal: merged,
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`HTTP ${res.status}：${text.slice(0, 200)}`);
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new Error('响应不是合法 JSON');
+  }
+}
+
 /** 抓取搜索页 HTML（节流 ≤1 次/intervalMs；中断/超时抛错由编排层降级处理） */
 export async function fetchSearchHtml(url: string, signal?: AbortSignal): Promise<string> {
   const wait = lastFetchAt + intervalMs - Date.now();

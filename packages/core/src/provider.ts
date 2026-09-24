@@ -344,8 +344,13 @@ export interface GeneralSettings {
   titleAutoRounds: number;
   /** 用户拒绝权限/提问后是否继续 agent loop（对齐 opencode：默认 false = 拒绝即停止本轮） */
   continueLoopOnDeny?: boolean;
-  /** 网页搜索（决策 17）：启用引擎（按固定优先级过滤）与结果条数 */
+  /** 网页搜索（决策 17）：AI 结构化检索（优先）+ HTML 引擎集合（兜底）与结果条数 */
   websearch: {
+    /** AI 检索引擎（key 非空且 enabled 才参与；级联优先 baidu-ai→exa，全败落 HTML 引擎） */
+    ai?: {
+      baidu?: { enabled?: boolean; apiKey?: string };
+      exa?: { enabled?: boolean; apiKey?: string };
+    };
     engines: string[];
     maxResults: number;
   };

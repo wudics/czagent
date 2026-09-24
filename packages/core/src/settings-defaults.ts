@@ -83,7 +83,11 @@ export const DEFAULT_GENERAL = {
   maxConcurrency: 4,
   titleAutoRounds: 1,
   continueLoopOnDeny: false,
-  websearch: { engines: ['bing', 'baidu', 'so360', 'sogou'], maxResults: 8 },
+  websearch: {
+    engines: ['bing', 'baidu', 'so360', 'sogou'],
+    maxResults: 8,
+    ai: { baidu: { enabled: false, apiKey: '' }, exa: { enabled: false, apiKey: '' } },
+  },
   compaction: { auto: true, reservedTokens: 20_000, preserveRatio: 0.25 },
   disabledSkills: [],
   scriptTimeoutMinutes: 0,

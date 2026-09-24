@@ -23,6 +23,12 @@ const SECTION_TITLE: Record<string, string> = {
 const MODES: ToolPermissionMode[] = ['allow', 'deny', 'ask'];
 const BUILTIN = new Set(TOOL_INVENTORY.map((t) => t.id));
 
+const DEFAULT_ENGINES = ['bing', 'baidu', 'so360', 'sogou'];
+const AI_ENGINES = [
+  { key: 'baidu' as const, label: 'settings.permissions.aiEngines.baidu', docs: 'https://console.bce.baidu.com/qianfan/' },
+  { key: 'exa' as const, label: 'settings.permissions.aiEngines.exa', docs: 'https://dashboard.exa.ai/api-keys' },
+];
+
 /** 某内置工具当前存储规则（偏离） */
 function storedRule(rules: PermissionRule[], tool: string): PermissionRule | undefined {
   return rules.find((r) => r.tool === tool);
@@ -46,6 +52,18 @@ export function PermissionsTab() {
   const [newPattern, setNewPattern] = useState('mcp_*');
 
   const wildcardRules = rules.filter((r) => !BUILTIN.has(r.tool));
+
+  /** websearch 局部更新：保留其余字段（engines/maxResults/ai 按需覆盖） */
+  const patchWebsearch = (patch: Partial<NonNullable<typeof general.websearch>>): void => {
+    const ws = general.websearch;
+    void updateGeneral({
+      websearch: { engines: ws?.engines ?? [...DEFAULT_ENGINES], maxResults: ws?.maxResults ?? 8, ai: ws?.ai, ...patch },
+    });
+  };
+  const patchAi = (key: 'baidu' | 'exa', p: { enabled?: boolean; apiKey?: string }): void => {
+    const entry = { enabled: false, apiKey: '', ...general.websearch?.ai?.[key], ...p };
+    patchWebsearch({ ai: { ...general.websearch?.ai, [key]: entry } });
+  };
 
   /** 写入某工具偏离：与默认一致则移除行（只存偏离） */
   const setTool = (tool: string, next: { enabled: boolean; mode: ToolPermissionMode }): void => {
@@ -179,15 +197,40 @@ export function PermissionsTab() {
             <div key={id} className="flex items-center justify-between">
               <span className="text-sm">{t(`settings.permissions.engines.${id}`)}</span>
               <Switch
-                checked={(general.websearch?.engines ?? ['bing', 'baidu', 'so360', 'sogou']).includes(id)}
+                checked={(general.websearch?.engines ?? DEFAULT_ENGINES).includes(id)}
                 onCheckedChange={(on) => {
-                  const engines = general.websearch?.engines ?? ['bing', 'baidu', 'so360', 'sogou'];
+                  const engines = general.websearch?.engines ?? DEFAULT_ENGINES;
                   const next = on ? [...engines, id] : engines.filter((e) => e !== id);
-                  void updateGeneral({ websearch: { engines: next, maxResults: general.websearch?.maxResults ?? 8 } });
+                  patchWebsearch({ engines: next });
                 }}
               />
             </div>
           ))}
+        </div>
+        <div className="mt-4 space-y-3 border-t pt-4">
+          <p className="text-xs text-muted-foreground">{t('settings.permissions.aiSearchHint')}</p>
+          {AI_ENGINES.map(({ key, label, docs }) => {
+            const entry = general.websearch?.ai?.[key];
+            const enabled = entry?.enabled ?? false;
+            return (
+              <div key={key} className="space-y-1">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">{t(label)}</span>
+                  <Switch checked={enabled} onCheckedChange={(on) => patchAi(key, { enabled: on })} />
+                </div>
+                <TextInput
+                  type="password"
+                  value={entry?.apiKey ?? ''}
+                  onChange={(e) => patchAi(key, { apiKey: e.target.value })}
+                  placeholder={t('settings.permissions.aiApiKey')}
+                  className="font-mono"
+                />
+                {enabled && !entry?.apiKey?.trim() ? (
+                  <p className="text-xs text-amber-500">{t('settings.permissions.aiKeyMissing', { docs })}</p>
+                ) : null}
+              </div>
+            );
+          })}
         </div>
         <div className="mt-4">
           <Field label={t('settings.permissions.maxResults')}>
@@ -195,14 +238,7 @@ export function PermissionsTab() {
               min={1}
               max={20}
               value={general.websearch?.maxResults ?? 8}
-              onChange={(e) =>
-                void updateGeneral({
-                  websearch: {
-                    engines: general.websearch?.engines ?? ['bing', 'baidu', 'so360', 'sogou'],
-                    maxResults: Math.min(20, Math.max(1, Number(e.target.value) || 8)),
-                  },
-                })
-              }
+              onChange={(e) => patchWebsearch({ maxResults: Math.min(20, Math.max(1, Number(e.target.value) || 8)) })}
             />
           </Field>
         </div>

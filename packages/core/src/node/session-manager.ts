@@ -37,7 +37,7 @@ import { isRichToolOutput } from '../tools/rich-output.js';
 import { scanSkills, skillEnabled } from '../skills/discovery.js';
 import { effectiveToolLoaded } from '../tools/policy.js';
 import { applyTodo, todoToText, TODO_HINT, type TodoInput } from '../tools/todo.js';
-import { isMcpServerEnabled, loadMcpConfig, readMcpLayers, writeGlobalMcpConfig } from '../mcp/config.js';
+import { loadMcpConfig, readMcpLayers, resolveMcpServerNames, writeGlobalMcpConfig } from '../mcp/config.js';
 import { McpRegistry, mcpServerPrefix } from '../mcp/registry.js';
 import { runEntryChild } from '../script/child.js';
 import type { ScriptAgentRunOptions, ScriptUseOverrides } from '../script/types.js';
@@ -1024,21 +1024,9 @@ export class SessionManager implements AgentProvider {
   }
 
   /**
-   * agent 是否"跟随全局的全开"（用于 MCP 服务器并入策略）：
-   * 遗留白名单（tools 非空）或含任何显式 load 覆盖 → 受限；否则视为全开。
-   */
-  private isAgentAllOpen(ag?: AgentDef): boolean {
-    if (!ag) return true;
-    if (ag.tools.length > 0) return false;
-    const ov = ag.toolOverrides;
-    if (!ov) return true;
-    return !Object.values(ov).some((o) => typeof o.load === 'boolean');
-  }
-
-  /**
-   * 计算该 agent 在该 cwd 下实际生效的 MCP 服务器名单（I13）：
-   * 全开 agent → 全局 enabled（enabled!==false）且非 agent 'off'；agent 'on' 覆盖全局关。
-   * 受限 agent → 仅 agent.mcp['on'] 的服务器（不点名即不带 MCP）。
+   * 计算该 agent 在该 cwd 下实际生效的 MCP 服务器名单（049）：
+   * 默认跟随全局启停（全局 enabled ∧ agent 未显式 off）；agent 'on' 覆盖全局关。
+   * 不看工具加载链——受限/全开 agent 一视同仁，避免矩阵物化把 MCP 静默清零。
    */
   private allowedMcpServers(cwd: string, ag?: AgentDef): string[] {
     let config: ReturnType<typeof loadMcpConfig>;
@@ -1047,16 +1035,7 @@ export class SessionManager implements AgentProvider {
     } catch {
       return [];
     }
-    const names = Object.keys(config);
-    if (this.isAgentAllOpen(ag)) {
-      return names.filter((n) => {
-        const o = ag?.mcp?.[n];
-        if (o === 'on') return true;
-        if (o === 'off') return false;
-        return isMcpServerEnabled(config[n]!);
-      });
-    }
-    return names.filter((n) => ag?.mcp?.[n] === 'on');
+    return resolveMcpServerNames(config, ag?.mcp);
   }
 
   /** 设置页 MCP Tab：读取两层配置（含来源） */
@@ -1561,11 +1540,11 @@ export class SessionManager implements AgentProvider {
           (agentOpts?.tools ? agentOpts.tools.includes(t.id) : effectiveToolLoaded(agentDef, rules, t.id)),
       );
     // MCP 并入：显式 mcpServers → 始终并入（tools 白名单仍可过滤，白名单中可直接写 mcp_* 工具 id）；
-    // 未显式传入 → 维持旧行为（仅全开 agent 且未传 tools 白名单时并入）
+    // 未显式传入 → 按生效名单并入（仅显式 tools 白名单会过滤掉）
     const mcpCandidates = agentOpts?.tools ? mcpTools.filter((t) => agentOpts.tools!.includes(t.id)) : mcpTools;
     if (agentOpts?.mcpServers) {
       resolved = resolved.concat(mcpCandidates);
-    } else if (!agentOpts?.tools && this.isAgentAllOpen(agentDef)) {
+    } else if (!agentOpts?.tools) {
       resolved = resolved.concat(mcpCandidates);
     }
     const target =

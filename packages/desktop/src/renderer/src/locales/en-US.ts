@@ -190,7 +190,7 @@ export default {
       noSkills: 'No skills (add SKILL.md and refresh)',
       mcp: {
         label: 'MCP Servers',
-        hint: 'Default "Follow global" toggle; new servers follow automatically. All-open agents include all enabled servers; restricted agents need "On"',
+        hint: 'Defaults to "Follow global" on/off (any globally enabled server is included). "Exclude" drops the server for this agent; "Force On" overrides a globally disabled server. The tool matrix does not affect MCP',
         inherit: 'Follow global',
         on: 'Force On',
         off: 'Exclude',

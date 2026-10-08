@@ -63,6 +63,9 @@ metadata:
 }
 ```
 
+**生效名单（049）**：全局 `enabled !== false` 即并入；agent 侧 `mcp: { <name>: 'on' | 'off' }` 为三态偏离（`on` 顶回全局已关、`off` 排除）。
+名单**与工具加载链解耦**——agent 的 `toolOverrides` / 遗留 `tools` 白名单不参与判定（判定函数 `resolveMcpServerNames`，`mcp/config.ts`）。
+
 ### 2.3 工具接入
 
 - MCP 暴露的 `tools` 经适配层包装为 `ToolDef` 注册进统一注册表（工具名加 server 前缀防冲突）。

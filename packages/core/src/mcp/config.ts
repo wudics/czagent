@@ -28,6 +28,23 @@ export function isMcpServerEnabled(cfg: McpServerConfig): boolean {
 
 export type McpConfig = Record<string, McpServerConfig>;
 
+/**
+ * 计算某 agent 的 MCP 生效服务器名单（049）：默认跟随全局启停（`enabled !== false` 即并入）；
+ * agent 显式 'off' 排除、'on' 顶回全局已关闭的服务器。
+ *
+ * 与工具加载链**解耦**：agent 的 `toolOverrides` / 遗留 `tools` 白名单不影响 MCP 生效范围
+ * （旧语义借 `isAgentAllOpen` 判定，而矩阵首次编辑即物化 `load:true` 会把全开 agent 翻成受限，
+ *  导致 MCP 静默清零）。
+ */
+export function resolveMcpServerNames(config: McpConfig, agentMcp?: Record<string, 'on' | 'off'>): string[] {
+  return Object.keys(config).filter((name) => {
+    const o = agentMcp?.[name];
+    if (o === 'off') return false;
+    if (o === 'on') return true;
+    return isMcpServerEnabled(config[name]!);
+  });
+}
+
 /** 判定传输类型：显式 type 优先；否则有 command → stdio，有 url → http */
 export function serverTransport(name: string, cfg: McpServerConfig): 'stdio' | 'http' {
   if (cfg.type) return cfg.type;

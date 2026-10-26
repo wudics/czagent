@@ -277,8 +277,10 @@ export interface ChatModelConfig {
   toolcall: boolean;
   /** 是否支持视觉输入；false 时图片附件降级为文件引用 */
   vision: boolean;
-  /** 透传给接口实现的额外请求体参数 */
+  /** 透传给接口实现的额外请求体参数（每次请求都合并；model/messages/stream 等关键字段会被忽略） */
   options?: Record<string, unknown>;
+  /** 按会话思考模式（off/on/deep）覆盖的请求体参数；优先级高于 options */
+  thinkingOptions?: Partial<Record<ThinkingMode, Record<string, unknown>>>;
 }
 
 /** 多模态/专用模型（自包含，独立于对话模型区；每个模型单独选择接口实现） */
@@ -292,6 +294,8 @@ export interface MultimodalModelConfig {
   modelName: string;
   /** 透传给接口实现的额外参数 */
   options?: Record<string, unknown>;
+  /** 按会话思考模式覆盖的请求体参数（图片理解等走 chat 协议的能力可用） */
+  thinkingOptions?: Partial<Record<ThinkingMode, Record<string, unknown>>>;
   enabled: boolean;
 }
 

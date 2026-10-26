@@ -13,13 +13,14 @@ import {
   type ChatModelConfig,
   type MultimodalCapability,
   type MultimodalModelConfig,
+  type ThinkingMode,
 } from '@czagent/core';
 import { useSettingsStore } from '../../stores/settings';
 import { Button } from '../ui/button';
 import { Select } from '../ui/select';
 import { Switch } from '../ui/switch';
 import { Badge } from '../ui/badge';
-import { Field, NumInput, Section, TextInput } from './fields';
+import { Field, NumInput, Section, TextArea, TextInput } from './fields';
 
 const CAP_LABEL: Record<Capability, string> = {
   chat: 'Chat',
@@ -57,6 +58,72 @@ interface ChatDraft {
   enabled: boolean;
   toolcall: boolean;
   vision: boolean;
+  options?: Record<string, unknown>;
+  thinkingOptions?: Partial<Record<ThinkingMode, Record<string, unknown>>>;
+}
+
+const THINKING_MODE_KEYS: ThinkingMode[] = ['off', 'on', 'deep'];
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** 模型配置 → 单框 JSON 文本（外层静态参数 + thinkingModes 分段） */
+function advancedText(m: ChatModelConfig | null): string {
+  if (!m) return '';
+  const options = m.options && Object.keys(m.options).length > 0 ? m.options : undefined;
+  const modes = m.thinkingOptions && Object.keys(m.thinkingOptions).length > 0 ? m.thinkingOptions : undefined;
+  if (!options && !modes) return '';
+  const combined: Record<string, unknown> = { ...(options ?? {}) };
+  if (modes) combined.thinkingModes = modes;
+  return JSON.stringify(combined, null, 2);
+}
+
+/** 编辑已有模型时，若已配置额外参数则默认展开 */
+function hasAdvancedConfig(m: ChatModelConfig | 'new'): boolean {
+  if (m === 'new') return false;
+  return Boolean(
+    (m.options && Object.keys(m.options).length > 0) ||
+      (m.thinkingOptions && Object.keys(m.thinkingOptions).length > 0),
+  );
+}
+
+type AdvancedParseResult =
+  | { ok: true; options?: Record<string, unknown>; thinkingOptions?: Partial<Record<ThinkingMode, Record<string, unknown>>> }
+  | {
+      ok: false;
+      reason: 'invalid' | 'not-object' | 'thinking-modes-not-object' | 'thinking-mode-key' | 'thinking-mode-not-object';
+      detail?: string;
+    };
+
+/** 解析单框 JSON：外层为通用参数，thinkingModes 为按会话档位覆盖 */
+function parseAdvancedOptions(text: string): AdvancedParseResult {
+  const s = text.trim();
+  if (!s) return { ok: true };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(s);
+  } catch {
+    return { ok: false, reason: 'invalid' };
+  }
+  if (!isPlainObject(parsed)) return { ok: false, reason: 'not-object' };
+
+  const { thinkingModes, ...options } = parsed;
+  const optionsValue = Object.keys(options).length > 0 ? options : undefined;
+  if (thinkingModes === undefined) return { ok: true, options: optionsValue };
+
+  if (!isPlainObject(thinkingModes)) return { ok: false, reason: 'thinking-modes-not-object' };
+  const modes: Partial<Record<ThinkingMode, Record<string, unknown>>> = {};
+  for (const [key, value] of Object.entries(thinkingModes)) {
+    if (!THINKING_MODE_KEYS.includes(key as ThinkingMode)) return { ok: false, reason: 'thinking-mode-key', detail: key };
+    if (!isPlainObject(value)) return { ok: false, reason: 'thinking-mode-not-object', detail: key };
+    modes[key as ThinkingMode] = value;
+  }
+  return {
+    ok: true,
+    options: optionsValue,
+    thinkingOptions: Object.keys(modes).length > 0 ? modes : undefined,
+  };
 }
 
 function draftFromChatModel(m: ChatModelConfig): ChatDraft {
@@ -98,6 +165,10 @@ function ChatModelDialog({
     editing && editing !== 'new' ? draftFromChatModel(editing) : newChatDraft(settings, 'deepseek'),
   );
   const [copiedHint, setCopiedHint] = useState(false);
+  const existing = editing && editing !== 'new' ? editing : null;
+  const [advancedOpen, setAdvancedOpen] = useState(() => hasAdvancedConfig(editing ?? 'new'));
+  const [extraText, setExtraText] = useState(() => advancedText(existing));
+  const [advancedError, setAdvancedError] = useState<string | null>(null);
   const patch = (p: Partial<ChatDraft>): void => setDraft((d) => ({ ...d, ...p }));
 
   const pickImpl = (implId: string): void => {
@@ -112,6 +183,24 @@ function ChatModelDialog({
   };
 
   const save = async (): Promise<void> => {
+    const parsedAdvanced = parseAdvancedOptions(extraText);
+    if (!parsedAdvanced.ok) {
+      const field = t('settings.models.extraOptions');
+      const message =
+        parsedAdvanced.reason === 'invalid'
+          ? t('settings.models.jsonInvalid', { field })
+          : parsedAdvanced.reason === 'not-object'
+            ? t('settings.models.jsonMustBeObject', { field })
+            : parsedAdvanced.reason === 'thinking-modes-not-object'
+              ? t('settings.models.thinkingModesNotObject')
+              : parsedAdvanced.reason === 'thinking-mode-key'
+                ? t('settings.models.thinkingModeKeyInvalid', { key: parsedAdvanced.detail })
+                : t('settings.models.thinkingModeNotObject', { mode: parsedAdvanced.detail });
+      setAdvancedError(message);
+      return;
+    }
+    setAdvancedError(null);
+
     const value: Omit<ChatModelConfig, 'id'> = {
       displayName: draft.displayName.trim() || draft.modelName.trim() || implName(draft.implId),
       implId: draft.implId as ChatModelConfig['implId'],
@@ -123,6 +212,8 @@ function ChatModelDialog({
       enabled: draft.enabled,
       toolcall: draft.toolcall,
       vision: draft.vision,
+      options: parsedAdvanced.options,
+      thinkingOptions: parsedAdvanced.thinkingOptions,
     };
     if (!value.modelName) return;
     if (isNew) {
@@ -181,6 +272,24 @@ function ChatModelDialog({
           <Switch checked={draft.vision} onCheckedChange={(v) => patch({ vision: v })} />
           {t('settings.models.vision')}
         </label>
+      </div>
+      <div className="rounded-md border border-border">
+        <button
+          type="button"
+          className="flex w-full items-center justify-between px-3 py-2 text-xs text-muted-foreground transition-colors hover:text-foreground"
+          onClick={() => setAdvancedOpen((v) => !v)}
+        >
+          <span>{t('settings.models.advanced')}</span>
+          <span>{advancedOpen ? t('settings.models.collapse') : t('settings.models.expand')}</span>
+        </button>
+        {advancedOpen && (
+          <div className="space-y-3 border-t border-border p-3">
+            <Field label={t('settings.models.extraOptions')} hint={t('settings.models.extraOptionsHint')}>
+              <TextArea rows={4} value={extraText} placeholder='{"temperature": 0.7}' onChange={(e) => setExtraText(e.target.value)} />
+            </Field>
+            {advancedError && <p className="text-xs text-destructive">{advancedError}</p>}
+          </div>
+        )}
       </div>
       <div className="flex justify-end gap-2 pt-1">
         <Button variant="ghost" onClick={onClose}>
@@ -439,13 +548,16 @@ export function ModelsTab() {
   );
 }
 
-/** 轻量弹窗壳（居中卡片 + 遮罩；点击遮罩关闭） */
+/** 轻量弹窗壳（居中卡片 + 遮罩；内容超高时内部滚动，点击遮罩关闭） */
 function DialogShell({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={onClose}>
-      <div className="w-full max-w-lg rounded-lg border border-border bg-background p-4 shadow-lg" onClick={(e) => e.stopPropagation()}>
-        <h3 className="mb-3 text-sm font-semibold">{title}</h3>
-        {children}
+      <div
+        className="flex max-h-[85vh] w-full max-w-lg flex-col rounded-lg border border-border bg-background shadow-lg"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 className="shrink-0 border-b border-border px-4 py-3 text-sm font-semibold">{title}</h3>
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4">{children}</div>
       </div>
     </div>
   );

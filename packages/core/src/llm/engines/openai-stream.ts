@@ -59,6 +59,19 @@ export function buildOpenAiMessages(
   });
 }
 
+/** 协议关键字段：模型额外参数不得覆盖（否则请求/流式解析会被写坏） */
+const RESERVED_BODY_KEYS = new Set(['model', 'messages', 'stream', 'stream_options']);
+
+/** 过滤模型透传参数中的协议关键字段 */
+function extraBody(obj: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!obj) return {};
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (!RESERVED_BODY_KEYS.has(k)) out[k] = v;
+  }
+  return out;
+}
+
 /** 组装 OpenAI 兼容 chat 请求体并发出（自动重试）；各引擎在 thinkingParams 里注入差异 */
 export async function openAiChatFetch(b: ChatBinding, req: ChatReq, opts: OpenAiChatOptions): Promise<Response> {
   const body: Record<string, unknown> = {
@@ -67,9 +80,12 @@ export async function openAiChatFetch(b: ChatBinding, req: ChatReq, opts: OpenAi
     stream: true,
     stream_options: { include_usage: true },
     ...(req.maxTokens ? { max_tokens: req.maxTokens } : {}),
+    // 优先级：引擎内置思考参数 < 模型额外参数 < 当前思考模式覆盖参数
     ...(opts.thinkingParams(req.thinking) ?? {}),
+    ...extraBody(b.options),
+    ...extraBody(req.options),
+    ...extraBody(b.thinkingOptions?.[req.thinking]),
     ...(req.tools && req.tools.length > 0 ? { tools: req.tools } : {}),
-    ...req.options,
   };
   return fetchJsonWithRetry(`${b.baseUrl}${OPENAI_CHAT_PATH}`, body, b.apiKey, req.signal);
 }
@@ -109,9 +125,14 @@ async function readUsageTail(sse: AsyncGenerator<string>): Promise<Record<string
   return undefined;
 }
 
+/** 思考内容字段自动识别顺序（模型未显式指定时） */
+const DEFAULT_REASONING_FIELDS = ['reasoning_content', 'reasoning'] as const;
+
 /** 消费 OpenAI 兼容 SSE 流 → LLMEvent（tool-call 增量聚合、usage 归一化、finish 后取尾帧再断流） */
-export async function* consumeOpenAiStream(res: Response, signal: AbortSignal | undefined, reasoningField = 'reasoning_content'): AsyncGenerator<LLMEvent> {
+export async function* consumeOpenAiStream(res: Response, signal: AbortSignal | undefined, reasoningField?: string): AsyncGenerator<LLMEvent> {
   if (!res.body) throw new LLMError('network', '响应无 body', {});
+
+  const reasoningFields: readonly string[] = reasoningField ? [reasoningField] : DEFAULT_REASONING_FIELDS;
 
   const cancelBody = (): void => {
     try {
@@ -165,8 +186,9 @@ export async function* consumeOpenAiStream(res: Response, signal: AbortSignal | 
       const choice = chunk?.choices?.[0];
       if (choice) {
         const delta = choice.delta ?? {};
-        if (typeof delta[reasoningField] === 'string' && delta[reasoningField]) {
-          yield { type: 'reasoning-delta', text: delta[reasoningField] };
+        const reasoningText = reasoningFields.map((f) => delta[f]).find((v): v is string => typeof v === 'string' && v !== '');
+        if (reasoningText) {
+          yield { type: 'reasoning-delta', text: reasoningText };
         }
         if (typeof delta.content === 'string' && delta.content) {
           yield { type: 'text-delta', text: delta.content };
@@ -228,7 +250,8 @@ export async function* consumeOpenAiStream(res: Response, signal: AbortSignal | 
 /** 组装 + 请求 + 消费的通用管道：各 chat 引擎只需提供自己的差异参数 */
 export async function* streamOpenAiChat(b: ChatBinding, req: ChatReq, opts: OpenAiChatOptions): AsyncGenerator<LLMEvent> {
   const res = await openAiChatFetch(b, req, opts);
-  yield* consumeOpenAiStream(res, req.signal, opts.reasoningField ?? 'reasoning_content');
+  // 引擎未指定字段时自动识别（兼容 reasoning_content / reasoning）
+  yield* consumeOpenAiStream(res, req.signal, opts.reasoningField);
 }
 
 export type { ChatEngine };

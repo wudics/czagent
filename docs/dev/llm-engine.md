@@ -6,6 +6,7 @@
 > - 模型配置持久化于 config.json 的 `chatModels`/`multimodalModels`（结构见 data-model.md §2.4），每条模型自带 implId/baseUrl/apiKey/modelName，自包含。
 > - 每家接口实现（API 版本算新 provider）一个独立引擎文件，协议差异写死在实现内；解析/校验/路由唯一入口 `llm/gateway.ts`。
 > - 新增 provider = 四步：`llm/engines/chat/` 新引擎文件 → `engines/index.ts` 注册 → `engines/catalog.ts` 元数据 → `provider.ts` 联合类型加字面量。
+> - 模型可配置额外请求体参数：`options` 每次请求合并，`thinkingOptions` 按会话思考档位覆盖；设置页用一个 JSON 编辑（见 §4.4）。
 
 ## 1. 能力（Capability）taxonomy
 
@@ -29,7 +30,7 @@ video-generation      # 视频生成
 ```
 provider.ts          # 根类型：ChatImplId/MMImplId 联合、ChatModelConfig/MultimodalModelConfig、Settings
 llm/gateway.ts       # ★ 唯一入口：解析（ResolvedChat 扁平视图）+ 校验（中文报错，不发未知请求）+ 按能力分发
-llm/types.ts         # ChatBinding（baseUrl/apiKey/modelName）、ChatReq（纯业务字段）、ChatEngine/MMEngine 接口
+llm/types.ts         # ChatBinding（baseUrl/apiKey/modelName/options/thinkingOptions）、ChatReq（纯业务字段）、ChatEngine/MMEngine 接口
 llm/engines/
   ├── http.ts        # 共享原语：fetchJsonWithRetry（429/5xx 退避、retry-after）
   ├── openai-stream.ts # 共享原语：OpenAI 兼容请求体组装、SSE→LLMEvent（tool-call 聚合、usage 归一化、finish 断流）
@@ -41,7 +42,8 @@ llm/engines/
 ```
 
 - **网关解析视图**：`ResolvedChat = { modelId, displayName, binding, engine, vision, toolcall, maxOutput, contextLimit, options }`——chat 与 image-understanding 模型在此抹平差异。
-- **options 合并**：模型配置级 options 与请求级 options 合并，调用方优先（修复旧体系 options 死字段问题）。
+- **options 合并**：模型配置级 `options` 先写入 `binding`，`Gateway.chat` 再与请求级 `options` 合并（调用方优先）；最终请求体由 `openai-stream.ts` 统一合并 `thinkingOptions[当前档位]`。
+- **思考档位覆盖**：合并优先级为「引擎内置 `thinkingParams(mode)` < 模型 `options` < 请求级 `options` < 模型 `thinkingOptions[mode]`」；`thinkingOptions` 只影响当前档位，`temperature` 等静态参数不受影响。
 
 ## 3. 统一事件模型 LLMEvent
 
@@ -67,8 +69,9 @@ type LLMEvent =
 共享管道 `streamOpenAiChat(binding, req, opts)`：各引擎只声明自己的差异（`OpenAiChatOptions`）——
 
 - `thinkingParams(mode)`：思考档位 → 追加到请求体的参数（写死在引擎文件内）
-- `reasoningField`：流式 delta 思考字段名（默认 `reasoning_content`）
+- `reasoningField`：流式 delta 思考字段名（可选；不指定时自动识别 `reasoning_content` → `reasoning`）
 - `reasoningPassthrough`：是否强制回传历史 assistant 思考内容（DeepSeek 工具场景 400 规则）
+- 所有引擎最后都会合并模型级 `options`、请求级 `options` 与当前档位的 `thinkingOptions`；协议关键字段由共享层过滤。
 
 ### 4.1 引擎差异表
 
@@ -80,9 +83,9 @@ type LLMEvent =
 | `bigmodel` | `https://open.bigmodel.cn/api/paas/v4` | `thinking:{type}` + `reasoning_effort:max`（deep 档） | `reasoning_content` | 标准 OpenAI SSE；默认 clear_thinking 清历史思考 |
 | `qwen` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `enable_thinking` + `reasoning_effort:xhigh`（deep 档） | `reasoning_content` | qwen3.8 preserve_thinking 默认回传历史思考（`reasoningPassthrough`） |
 | `openrouter` | `https://openrouter.ai/api/v1` | `reasoning:{effort}`（off=none / deep=max） | `reasoning`（统一格式） | 标准 OpenAI 兼容 + 平台扩展字段 |
-| `openai-compatible`（兜底） | 用户自填 | 无（不发平台差异参数） | `reasoning_content` | 任意 OpenAI 兼容服务；不支持思考档位 |
+| `openai-compatible`（兜底） | 用户自填 | 无内置；由模型 `options` / `thinkingOptions` 提供 | 自动识别 `reasoning_content` → `reasoning` | 任意 OpenAI 兼容服务；设置页高级参数可按模型文档注入思考参数 |
 
-> 思考档位映射（决策 15：off/on/deep）：`off` 尽量关闭思考，`on` 平台默认行为，`deep` 该平台最高推理档。个别模型（如 GLM-5.3 仅允许 enabled、qwen 非思考老模型不识别 enable_thinking）传参报 400 时，用户可切换 `openai-compatible` 兜底。
+> 思考档位映射（决策 15：off/on/deep）：`off` 尽量关闭思考，`on` 平台默认行为，`deep` 该平台最高推理档。个别模型（如 GLM-5.3 仅允许 enabled、qwen 非思考老模型不识别 enable_thinking）传参报 400 时，可切换 `openai-compatible`，并在设置页高级参数中按模型文档填写请求体参数（见 §4.4）。
 
 ### 4.2 流式解析（SSE，共享）
 
@@ -97,17 +100,56 @@ type LLMEvent =
 - 错误分类（`llm/errors.ts`）：401/403→Authentication；429→RateLimit/Quota；400/413/422→InvalidRequest（含 context-overflow 判定）；5xx→ProviderInternal。
 - 网关前置校验：模型不存在 / Key 缺失 / implId 未注册 / 能力未绑定或模型被禁用 → 中文报错，不发请求。
 
+### 4.4 模型额外请求参数（高级参数）
+
+设置 → 模型 → 添加/编辑对话模型 → 「高级参数（可选）」提供**单个 JSON 输入框**，所有 chat 模型均可配置。新建模型默认折叠；已有 `options`/`thinkingOptions` 的模型默认展开。
+
+```json
+{
+  "temperature": 0.7,
+  "thinkingModes": {
+    "off": { "reasoning_effort": "none" },
+    "on": { "reasoning_effort": "medium" },
+    "deep": { "reasoning_effort": "xhigh" }
+  }
+}
+```
+
+- **外层键**：除 `thinkingModes` 外都写入 `options`，每次请求都合并，适合 `temperature`、`top_p`、`reasoning_effort` 等静态参数。
+- **`thinkingModes`**：保留键，只允许 `off` / `on` / `deep`，每个值必须是 JSON 对象。会话选中对应档位时才合并该桶；未配置的档位只发外层静态参数。保存前校验，非法 JSON / 非对象 / 非法档位键会直接报错，不写入配置。
+- **合并优先级**（后者覆盖前者）：引擎内置 `thinkingParams(mode)` → 模型 `options` → 请求级 `options` → 模型 `thinkingOptions[mode]`。`thinkingModes` 只影响当前档位，不会改动 `temperature` 等静态参数。
+- **保留字段**：`model` / `messages` / `stream` / `stream_options` 由代码生成，额外参数中的同名键会被忽略，防止破坏请求与流式解析。
+- **思考字段**：共享层自动识别流式 delta 的 `reasoning_content`，没有再取 `reasoning`（AMD 等平台使用后者），无需单独配置字段名。
+
+**AMD Radeon Cloud 实测（2026-10）**
+
+`Qwen3.8-Flash-Next` 的 `reasoning_effort` 用 `medium` / `xhigh` 可正常开启思考；但 `none` 会被接口忽略，仍返回 reasoning。关闭思考必须改用 `chat_template_kwargs`：
+
+```json
+{
+  "thinkingModes": {
+    "off": { "chat_template_kwargs": { "enable_thinking": false } },
+    "on": { "reasoning_effort": "medium" },
+    "deep": { "reasoning_effort": "xhigh" }
+  }
+}
+```
+
+实测 `enable_thinking: false` 时 reasoning 长度为 0；`off` 桶不要再同时写 `reasoning_effort: "none"`，避免两个参数冲突。
+
+`DeepSeek-V4-Flash` 当前实测 `none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` 均不返回 reasoning（`reasoning_tokens = 0`），属于 AMD 接口/模型侧限制，不是配置问题；需要思考可改用 `Qwen3.8-Flash-Next`，或等待 `DeepSeek-V4.1-Flash` 并发限制缓解后验证。
+
 ## 5. 模型目录（决策 5 · 修订）
 
 模型目录不再内置代码常量，**用户在设置页自建**（默认空，旧 `providers`/`models` 结构启动时检测重置）：
 
-- **对话模型**（chatModels）：每条 = 接口实现（implId）+ 地址 + Key + 模型名 + 展示名 + 上下文/输出上限 + toolcall/vision 开关 + options；添加时按 implId 预填默认地址、复用同实现 Key。
-- **多模态模型**（multimodalModels）：每条绑定一个 capability（embedding/rerank/image-generation/video-generation/tts/asr/image-understanding）+ implId + 地址/Key/模型名；image-understanding 路由到 chat 引擎。
+- **对话模型**（chatModels）：每条 = 接口实现（implId）+ 地址 + Key + 模型名 + 展示名 + 上下文/输出上限 + toolcall/vision 开关 + `options` / `thinkingOptions`；添加时按 implId 预填默认地址、复用同实现 Key。
+- **多模态模型**（multimodalModels）：每条绑定一个 capability（embedding/rerank/image-generation/video-generation/tts/asr/image-understanding）+ implId + 地址/Key/模型名 + `options` / `thinkingOptions`；image-understanding 路由到 chat 引擎。
 - **能力绑定**（bindings）：8 个能力 → 模型 id；会话与工具经 Gateway 按绑定解析，未绑定中文报错。用户手动设置默认，添加模型不自动抢占绑定。
 
 ### 5.1 自定义厂商
 
-接口实现下拉中的 `openai-compatible` 兜底任意 OpenAI 兼容服务（自填地址与 Key，无平台差异参数）；同名接口实现间添加模型自动复用 Key 与地址。
+接口实现下拉中的 `openai-compatible` 兜底任意 OpenAI 兼容服务（自填地址与 Key，无内置平台差异参数；需要时用设置页高级参数按模型文档注入，见 §4.4）；同名接口实现间添加模型自动复用 Key 与地址。
 
 ## 6. 自主选择模型（决策 6）
 

@@ -75,14 +75,15 @@
 
 ```ts
 interface Settings {
-  chatModels: ChatModelConfig[]          // 对话模型：id(自动 mdl-*)/displayName/implId/baseUrl/apiKey/modelName/contextLimit/maxOutput/enabled/toolcall/vision/options
-  multimodalModels: MultimodalModelConfig[] // 多模态与专用模型：多 capability/implId/baseUrl/apiKey/modelName/options/enabled
+  chatModels: ChatModelConfig[]          // 对话模型：id(自动 mdl-*)/displayName/implId/baseUrl/apiKey/modelName/contextLimit/maxOutput/enabled/toolcall/vision/options/thinkingOptions
+  multimodalModels: MultimodalModelConfig[] // 多模态与专用模型：多 capability/implId/baseUrl/apiKey/modelName/options/thinkingOptions/enabled
   bindings: CapabilityBinding[]          // 能力 → 模型 id
   agents / permissions / general
 }
 ```
 
 - `implId` 指向代码内置的接口实现注册表（`llm/engines/index.ts`）：chat 为 deepseek / siliconflow / agnes / bigmodel / qwen / openrouter / openai-compatible（兜底）；多模态按能力各有针对性实现 + OpenAI 兼容兜底。元数据（显示名/默认地址/适用能力）在 `llm/engines/catalog.ts`（纯，渲染层直引）。
+- **额外请求参数**：`options` 为每次请求都合并的静态参数；`thinkingOptions` 形如 `{ off/on/deep: { ... } }`，仅会话选中对应档位时覆盖。设置页将两者合并显示为单个 JSON（`thinkingModes` 为保留键），保存时再拆分存储。合并优先级、保留字段与 AMD 实测见 `llm-engine.md §4.4`。
 - 解析与校验统一收敛于 `llm/gateway.ts`（唯一入口）；未注册/未配置 Key 主动中文报错，不发未知请求。
 
 ### 2.5 `attachments` 附件表

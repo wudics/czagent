@@ -42,6 +42,21 @@ export const NumInput = React.forwardRef<
 ));
 NumInput.displayName = 'NumInput';
 
+export const TextArea = React.forwardRef<
+  HTMLTextAreaElement,
+  React.TextareaHTMLAttributes<HTMLTextAreaElement>
+>(({ className, ...props }, ref) => (
+  <textarea
+    ref={ref}
+    className={cn(
+      'w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs leading-relaxed outline-none transition-colors focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50',
+      className,
+    )}
+    {...props}
+  />
+));
+TextArea.displayName = 'TextArea';
+
 export function Section({ title, children, action }: { title: string; children: React.ReactNode; action?: React.ReactNode }) {
   return (
     <section className="rounded-lg border border-border">

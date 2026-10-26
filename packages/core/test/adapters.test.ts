@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createDefaultSettings, type ChatModelConfig, type MultimodalModelConfig, type Settings } from '../src/index.js';
+import { createDefaultSettings, type ChatModelConfig, type MultimodalModelConfig, type Settings, type ThinkingMode } from '../src/index.js';
 import { CHAT_ENGINES, Gateway } from '../src/node.js';
 import { imageGenerateTool, ttsTool, videoGenerateTool, imageEditTool, type ToolContext } from '../src/tools/index.js';
 import { isRichToolOutput } from '../src/tools/rich-output.js';
@@ -258,6 +258,82 @@ describe('chat 引擎差异', () => {
     const body = JSON.parse(calls.at(-1)!.body);
     expect(body).toMatchObject({ max_tokens: 128, temperature: 0.5 });
     expect(body.tools).toHaveLength(1);
+  });
+
+  it('thinkingOptions 按会话档位覆盖 options，普通参数不受影响', async () => {
+    stubFetch([
+      { test: (url, method) => method === 'POST' && url.endsWith('/chat/completions'), respond: () => sseResponse([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]) },
+    ]);
+    const s = settingsWith({
+      chat: [
+        chatModel({
+          options: { temperature: 0.4 },
+          thinkingOptions: {
+            off: { reasoning_effort: 'none' },
+            on: { reasoning_effort: 'medium' },
+            deep: { reasoning_effort: 'high' },
+          },
+        }),
+      ],
+    });
+    const expected: Array<[ThinkingMode, string]> = [
+      ['off', 'none'],
+      ['on', 'medium'],
+      ['deep', 'high'],
+    ];
+    for (const [mode, effort] of expected) {
+      for await (const _ of gateway.chat(s, 'mdl-chat', { messages: [{ role: 'user', content: 'q' }], thinking: mode })) {
+        // 消费完毕
+      }
+      const body = JSON.parse(calls.at(-1)!.body);
+      expect(body.temperature).toBe(0.4);
+      expect(body.reasoning_effort).toBe(effort);
+    }
+
+    // 未配置的档位只发外层静态参数
+    const s2 = settingsWith({ chat: [chatModel({ options: { temperature: 0.4 }, thinkingOptions: { deep: { reasoning_effort: 'high' } } })] });
+    for await (const _ of gateway.chat(s2, 'mdl-chat', { messages: [{ role: 'user', content: 'q' }], thinking: 'on' })) {
+      // 消费完毕
+    }
+    const fallback = JSON.parse(calls.at(-1)!.body);
+    expect(fallback.temperature).toBe(0.4);
+    expect(fallback.reasoning_effort).toBeUndefined();
+  });
+
+  it('额外参数不能覆盖 model/messages/stream 等协议关键字段', async () => {
+    stubFetch([
+      { test: (url, method) => method === 'POST' && url.endsWith('/chat/completions'), respond: () => sseResponse([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]) },
+    ]);
+    const s = settingsWith({
+      chat: [chatModel({ options: { model: 'hacked', messages: [], stream: false, stream_options: {}, temperature: 0.2 } })],
+    });
+    for await (const _ of gateway.chat(s, 'mdl-chat', { messages: [{ role: 'user', content: 'q' }], thinking: 'off' })) {
+      // 消费完毕
+    }
+    const body = JSON.parse(calls.at(-1)!.body);
+    expect(body.model).toBe('test-chat-model');
+    expect(body.stream).toBe(true);
+    expect(body.stream_options).toEqual({ include_usage: true });
+    expect(body.messages).toHaveLength(1);
+    expect(body.temperature).toBe(0.2);
+  });
+
+  it('openai-compatible 自动识别 delta.reasoning（AMD 格式）', async () => {
+    stubFetch([
+      {
+        test: (url, method) => method === 'POST' && url.endsWith('/chat/completions'),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { reasoning: 'AMD 思考' } }] },
+            { choices: [{ delta: { content: '答案', finish_reason: 'stop' } }] },
+          ]),
+      },
+    ]);
+    const s = settingsWith({ chat: [chatModel()] });
+    const events = [];
+    for await (const ev of gateway.chat(s, 'mdl-chat', { messages: [{ role: 'user', content: 'q' }], thinking: 'on' })) events.push(ev);
+    expect(events.some((e) => e.type === 'reasoning-delta' && e.text === 'AMD 思考')).toBe(true);
+    expect(events.some((e) => e.type === 'text-delta' && e.text === '答案')).toBe(true);
   });
 });
 

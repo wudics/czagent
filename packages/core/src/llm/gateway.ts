@@ -77,7 +77,13 @@ export class Gateway {
     return {
       modelId: model.id,
       displayName: model.displayName,
-      binding: { baseUrl: trimSlash(model.baseUrl), apiKey: model.apiKey, modelName: model.modelName },
+      binding: {
+        baseUrl: trimSlash(model.baseUrl),
+        apiKey: model.apiKey,
+        modelName: model.modelName,
+        ...(model.options && Object.keys(model.options).length > 0 ? { options: model.options } : {}),
+        ...(model.thinkingOptions && Object.keys(model.thinkingOptions).length > 0 ? { thinkingOptions: model.thinkingOptions } : {}),
+      },
       engine,
       vision: !('vision' in model) || model.vision !== false,
       toolcall: !('toolcall' in model) || model.toolcall !== false,

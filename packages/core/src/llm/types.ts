@@ -28,6 +28,10 @@ export interface ChatBinding {
   baseUrl: string;
   apiKey: string;
   modelName: string;
+  /** 模型级额外请求体参数（每次请求合并；关键协议字段由 openai-stream 过滤） */
+  options?: Record<string, unknown>;
+  /** 按思考模式覆盖的请求体参数（优先于引擎内置思考参数与 options） */
+  thinkingOptions?: Partial<Record<ThinkingMode, Record<string, unknown>>>;
 }
 
 /** 对话请求（纯业务字段；协议差异由各家引擎自行处理） */

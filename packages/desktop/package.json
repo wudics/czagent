@@ -1,7 +1,7 @@
 {
   "name": "@czagent/desktop",
   "productName": "czagent",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "private": true,
   "author": "czagent <czagent@example.com>",
   "homepage": "https://github.com/czagent/czagent",

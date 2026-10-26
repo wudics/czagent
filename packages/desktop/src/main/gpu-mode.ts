@@ -46,6 +46,11 @@ export interface GpuInitResult {
   markerPath: string;
 }
 
+/** 避免 marker.reason 每次启动都多一层 `cached:`，只保留一个稳定前缀。 */
+function cachedReason(reason: string): string {
+  return `cached:${reason.replace(/^(?:cached:)+/, '')}`;
+}
+
 function getUserDataDir(): string {
   try {
     return app.getPath('userData');
@@ -447,8 +452,9 @@ export function initGpuMode(): GpuInitResult {
   if (cached) {
     if (marker.mode === 'software') {
       applySoftwareRendering();
-      logGpu(`GPU mode: software (cached:${marker.reason})`);
-      return { mode: 'software', reason: `cached:${marker.reason}`, markerPath };
+      const reason = cachedReason(marker.reason);
+      logGpu(`GPU mode: software (${reason})`);
+      return { mode: 'software', reason, markerPath };
     }
 
     if (shouldFallbackStartup(marker)) {
@@ -458,9 +464,10 @@ export function initGpuMode(): GpuInitResult {
       return { mode: 'software', reason: 'cached:previous-startup-failed', markerPath };
     }
 
-    markHardwareStartup(`cached:${marker.reason}`);
-    logGpu(`GPU mode: hardware (cached:${marker.reason})`);
-    return { mode: 'hardware', reason: `cached:${marker.reason}`, markerPath };
+    const reason = cachedReason(marker.reason);
+    markHardwareStartup(reason);
+    logGpu(`GPU mode: hardware (${reason})`);
+    return { mode: 'hardware', reason, markerPath };
   }
 
   // 开发态不自动探测，避免影响日常开发；打包后完整启用。
@@ -548,7 +555,7 @@ export function printGpuStatus(): void {
   } else if (!enableByCli && isGpuMarkerUsable(marker, appVersion, electronVersion)) {
     lines.push(
       `mode: ${marker.mode}`,
-      `reason: cached:${marker.reason}`,
+      `reason: ${cachedReason(marker.reason)}`,
       `startupPending: ${marker.startupPending === true}`,
     );
   } else if (process.platform !== 'linux') {

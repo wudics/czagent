@@ -44,6 +44,30 @@ const config: Configuration = {
     category: 'Development',
     executableName: 'czagent',
     artifactName: '${productName}-${version}_${arch}.${ext}',
+    // Debian control 的 Description 首行；不设置时 electron-builder 会生成空的 synopsis。
+    synopsis: 'czagent 桌面客户端',
+    description: 'czagent 桌面端（electron-vite + React）',
+  },
+  deb: {
+    // 这些库在纯净 Deepin 25 上通常已安装；显式声明后 apt install ./xxx.deb 可自动补齐。
+    // 同时用 | 兼容 Debian 13 的 t64 包名，避免只面向 Deepin 时锁死包名。
+    depends: [
+      'libgtk-3-0 | libgtk-3-0t64',
+      'libnotify4',
+      'libnss3',
+      'libxss1',
+      'libxtst6 | libxtst6t64',
+      'xdg-utils',
+      'libatspi2.0-0 | libatspi2.0-0t64',
+      'libuuid1',
+      'libsecret-1-0',
+      'libgbm1',
+      'libasound2 | libasound2t64',
+      'libdrm2',
+      'libxkbcommon0',
+    ],
+    priority: 'optional',
+    packageCategory: 'utils',
   },
   // better-sqlite3 的 prebuilt 二进制与当前 Electron ABI 兼容（dev 模式长期验证），
   // 打包跳过源码 rebuild（免 Visual Studio 依赖）；node-pty/sharp 自带各平台 prebuilt。

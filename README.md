@@ -59,7 +59,7 @@ pnpm --filter @czagent/desktop package      # 正式包：AppImage + deb
 | 文件 | 说明 |
 |---|---|
 | `czagent-<版本>_x86_64.AppImage` | 免安装，`chmod +x` 后直接运行 |
-| `czagent-<版本>_amd64.deb` | `sudo dpkg -i czagent-<版本>_amd64.deb` 安装 |
+| `czagent-<版本>_amd64.deb` | `sudo apt install ./czagent-<版本>_amd64.deb` 安装（自动补齐依赖） |
 
 ### 跨平台打包（Windows → Linux/macOS）
 
@@ -108,7 +108,7 @@ scp czagent-src.tar.gz user@linux:/path/to/
 tar xzf czagent-src.tar.gz && cd czagent && pnpm install && pnpm --filter @czagent/desktop build && pnpm --filter @czagent/desktop package
 ```
 
-产物在 `packages/desktop/release/`：`.AppImage`（免安装双击运行）和 `.deb`（`dpkg -i` 安装）。
+产物在 `packages/desktop/release/`：`.AppImage`（免安装双击运行）和 `.deb`（`sudo apt install ./xxx.deb` 安装）。
 
 macOS 同理，但必须在 macOS 机器上执行（electron-builder 限制），产物为 `.dmg`。
 
@@ -129,6 +129,8 @@ macOS 同理，但必须在 macOS 机器上执行（electron-builder 限制）�
 - `asarUnpack`：better-sqlite3 / sharp + `@img/*`（libvips 共享库）/ node-pty（bash PTY）/ `@esbuild/*`（脚本子进程 bundle 二进制；unix 在 `bin/esbuild`，win32 在包根，见 `resolvePackagedEsbuildBin`）
 - 内置技能经 `extraResources` 拷入，打包态 main 从 `process.resourcesPath/skills` 读取
 - 当前**未做代码签名**：Windows 有 SmartScreen 提示（“仍要运行”），macOS 未公证需手动放行；更新所需的 `.blockmap` 已随产物输出
+- Linux 启动时自动探测 GPU：物理机默认硬件加速；虚拟机、GLES2-only、无 `/dev/dri/renderD*` 环境自动软件渲染。可用 `czagent --gpu-status` 查看判定；`--disable-gpu` 强制软件渲染并写入标记，`--force-gpu` 强制尝试硬件加速，`--enable-gpu` 重新探测
+- deb 的 `Depends` 已包含 `libgbm1`、`libasound2`、`libdrm2`、`libxkbcommon0`；请用 `apt install ./xxx.deb`，不要用 `dpkg -i`
 
 ## 文档
 

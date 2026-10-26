@@ -4,6 +4,20 @@ import { pathToFileURL } from 'node:url';
 import { ConfigStore, openDb, SessionManager, type Db } from '@czagent/core/node';
 import { IPC } from '@shared/ipc';
 import type { SessionEvent } from '@czagent/core';
+import {
+  applySoftwareRendering,
+  getGpuMarkerPath,
+  initGpuMode,
+  installGpuFailureHandler,
+  isGpuProbeMode,
+  isGpuStatusMode,
+  logGpu,
+  markGpuStartupSuccess,
+  printGpuStatus,
+  recordRuntimeGpuStatus,
+  runGpuProbeMode,
+  setGpuMarker,
+} from './gpu-mode';
 let db: Db | null = null;
 let manager: SessionManager | null = null;
 
@@ -31,7 +45,7 @@ function isExternalLink(url: string): boolean {
   return /^https?:\/\//i.test(url) || url.startsWith('mailto:');
 }
 
-function createWindow(): BrowserWindow {
+function createWindow(gpuMode: 'hardware' | 'software'): BrowserWindow {
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -51,7 +65,49 @@ function createWindow(): BrowserWindow {
     },
   });
 
-  win.on('ready-to-show', () => win.show());
+  let showFallback: ReturnType<typeof setTimeout> | null = null;
+  let shown = false;
+
+  const showWindow = (reason: string): void => {
+    if (win.isDestroyed()) return;
+    if (!win.isVisible()) win.show();
+    if (!shown) {
+      shown = true;
+      // 只有窗口真正显示后才清除 hardware startupPending。
+      // 若 GPU 阶段直接崩溃，下次启动会自动回退软件渲染。
+      markGpuStartupSuccess();
+      logGpu(`window shown (${reason})`);
+      setTimeout(() => recordRuntimeGpuStatus(gpuMode), 1_000);
+    }
+    if (showFallback) {
+      clearTimeout(showFallback);
+      showFallback = null;
+    }
+  };
+
+  win.once('ready-to-show', () => showWindow('ready-to-show'));
+
+  // 兜底：即使 ready-to-show 因 GPU/合成器问题不触发，也要让窗口可见。
+  showFallback = setTimeout(() => showWindow('fallback-timeout'), 5_000);
+  win.once('closed', () => {
+    if (showFallback) {
+      clearTimeout(showFallback);
+      showFallback = null;
+    }
+  });
+
+  win.webContents.on('render-process-gone', (_event, details) => {
+    console.error(
+      `[czagent] renderer process gone: reason=${details.reason} exit=${details.exitCode}`,
+    );
+    if (!win.isDestroyed() && !win.isVisible()) win.show();
+  });
+  win.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    console.error(
+      `[czagent] renderer failed to load ${validatedURL}: ${errorCode} ${errorDescription}`,
+    );
+    if (!win.isDestroyed() && !win.isVisible()) win.show();
+  });
 
   // 外链一律走系统默认浏览器，禁止窗口内导航（markdown 链接 / websearch 结果等）
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -109,41 +165,70 @@ function registerIpc(mgr: SessionManager): void {
   });
 }
 
-app.whenReady().then(() => {
-  Menu.setApplicationMenu(null);
-  registerLocalMediaProtocol();
-
-  const userData = app.getPath('userData');
-  db = openDb(join(userData, 'czagent.db'));
-  // 内置技能目录：开发态在源码 resources/；打包态由 electron-builder extraResources 拷到 resourcesPath/skills
-  const builtinSkillsDir = app.isPackaged
-    ? join(process.resourcesPath, 'skills')
-    : join(__dirname, '../../resources/skills');
-  manager = new SessionManager({
-    db,
-    config: new ConfigStore(userData),
-    attachmentsDir: join(userData, 'attachments'),
-    builtinSkillsDir,
-  });
-  manager.onEvent(broadcast);
-  registerIpc(manager);
-
-  createWindow();
-
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
-});
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
-
-app.on('will-quit', () => {
-  if (db) {
-    db.sqlite.close();
-    db = null;
+if (isGpuProbeMode()) {
+  // 独立探测进程：只创建隐藏窗口读取 GPU 状态，不加载数据库/主窗口。
+  runGpuProbeMode();
+} else if (isGpuStatusMode()) {
+  printGpuStatus();
+} else {
+  let gpuMode: 'hardware' | 'software' = 'software';
+  try {
+    const gpu = initGpuMode();
+    gpuMode = gpu.mode;
+    logGpu(`GPU marker: ${getGpuMarkerPath()}`);
+  } catch (error) {
+    // 任何判断异常都保守回退软件渲染，避免审核机直接黑屏/无窗口。
+    console.error('[czagent] GPU init failed', error);
+    applySoftwareRendering();
+    setGpuMarker('software', `init-error:${String(error).slice(0, 300)}`);
+    gpuMode = 'software';
+    logGpu(`GPU mode: software (init-error:${String(error).slice(0, 300)})`);
   }
-  // 尽力关闭 MCP 连接（stdio 子进程随退出回收）
-  void manager?.closeMcp();
-});
+
+  installGpuFailureHandler(gpuMode);
+
+  app
+    .whenReady()
+    .then(() => {
+      Menu.setApplicationMenu(null);
+      registerLocalMediaProtocol();
+
+      const userData = app.getPath('userData');
+      db = openDb(join(userData, 'czagent.db'));
+      // 内置技能目录：开发态在源码 resources/；打包态由 electron-builder extraResources 拷到 resourcesPath/skills
+      const builtinSkillsDir = app.isPackaged
+        ? join(process.resourcesPath, 'skills')
+        : join(__dirname, '../../resources/skills');
+      manager = new SessionManager({
+        db,
+        config: new ConfigStore(userData),
+        attachmentsDir: join(userData, 'attachments'),
+        builtinSkillsDir,
+      });
+      manager.onEvent(broadcast);
+      registerIpc(manager);
+
+      createWindow(gpuMode);
+
+      app.on('activate', () => {
+        if (BrowserWindow.getAllWindows().length === 0) createWindow(gpuMode);
+      });
+    })
+    .catch((error) => {
+      console.error('[czagent] startup failed', error);
+      app.exit(1);
+    });
+
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit();
+  });
+
+  app.on('will-quit', () => {
+    if (db) {
+      db.sqlite.close();
+      db = null;
+    }
+    // 尽力关闭 MCP 连接（stdio 子进程随退出回收）
+    void manager?.closeMcp();
+  });
+}

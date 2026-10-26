@@ -92,7 +92,9 @@ scp czagent-src.tar.gz user@linux:/path/to/
 tar xzf czagent-src.tar.gz && cd czagent && pnpm install && pnpm --filter @czagent/desktop build && pnpm --filter @czagent/desktop package
 ```
 
-产物在 `packages/desktop/release/`：`.AppImage`（免安装双击运行）和 `.deb`（`dpkg -i` 安装）。
+产物在 `packages/desktop/release/`：`.AppImage`（免安装双击运行）和 `.deb`（`sudo apt install ./xxx.deb` 安装，自动补齐依赖）。
+
+Linux 包内置 GPU 自适应：物理机默认硬件加速；虚拟机/GLES2-only/无 render node 自动软件渲染，并写入 `~/.config/czagent/gpu-mode.json`。可用 `czagent --gpu-status` 查看当前判定；`--disable-gpu` 强制软件渲染并写入标记，`--force-gpu` 强制尝试硬件加速，`--enable-gpu` 清除缓存重新探测。判定原因和启动阶段日志在 `~/.config/czagent/logs/gpu.log`。
 
 macOS 同理，但必须在 macOS 机器上执行（electron-builder 限制），产物为 `.dmg`。
 
